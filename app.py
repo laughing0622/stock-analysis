@@ -1,3 +1,12 @@
+# 确保当前目录在sys.path最前面，避免导入xueqiu的config
+import sys
+import os
+current_dir = os.path.dirname(os.path.abspath(__file__))
+# 无条件移除后重新插入到最前面，确保优先级
+if current_dir in sys.path:
+    sys.path.remove(current_dir)
+sys.path.insert(0, current_dir)
+
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
@@ -5,11 +14,180 @@ from plotly.subplots import make_subplots
 from data_engine import engine, INDEX_MAP, FUTURES_VARIETIES, FUTURES_NAME_MAP
 from datetime import datetime, timedelta
 from analysis.stock.wyckoff import WyckoffAnalyzer
+from analysis.stock.llm_client import StockLLMClient
+from analysis.stock.plotting import plot_wyckoff_chart
+from config import GEMINI_API_KEY
+
+# 导入新页面
+from pages.tab4_capital import render_capital_tab
+from pages.tab5_strategies import render_strategies_tab
 
 st.set_page_config(layout="wide", page_title="AlphaMonitor Pro", page_icon="🦅")
 
 # ==========================================
 # 修复1：恢复 Tab 样式 (大字体+加粗)
+# ==========================================
+st.markdown("""
+<style>
+    /* 恢复 Tab 样式 */
+    .stTabs [data-baseweb="tab-list"] button [data-testid="stMarkdownContainer"] p {
+        font-size: 18px;
+        font-weight: bold;
+    }
+    /* 调整单选按钮布局 */
+    div.row-widget.stRadio > div { flex-direction: row; }
+    div.row-widget.stRadio > div > label { 
+        background-color: #f0f2f6; padding: 5px 15px; 
+        border-radius: 5px; margin-right: 10px; border: 1px solid #e0e0e0;
+    }
+    div.row-widget.stRadio > div > label[data-baseweb="radio"] { background-color: transparent; }
+</style>
+""", unsafe_allow_html=True)
+
+# ==========================================
+# Tab 5: 个股·深度 (新增)
+# ==========================================
+def render_stock_tab():
+    st.markdown("#### 🔍 个股深度分析 (威科夫/LLM)")
+    
+    # 初始化 session state
+    if 'stock_analysis_result' not in st.session_state:
+        st.session_state.stock_analysis_result = None
+    if 'stock_analysis_code' not in st.session_state:
+        st.session_state.stock_analysis_code = ""
+
+    # 配置区域
+    with st.expander("🛠️ 设置与提示词", expanded=(st.session_state.stock_analysis_result is None)):
+        c1, c2 = st.columns([1, 1])
+        with c1:
+            # 优先使用 Config 中的 Key，否则让用户输入
+            api_key = GEMINI_API_KEY
+            if not api_key:
+                api_key = st.text_input("Gemini API Key", type="password", help="未在 config.py 配置，请在此输入")
+            else:
+                st.success("API Key 已从配置文件加载")
+                
+            stock_input = st.text_input("股票代码/名称", value="000001", help="支持输入: 600519, 茅台, 000001")
+            days_input = st.number_input("分析天数", value=365, min_value=100, max_value=1000, step=100)
+
+            default_system_prompt = """你现在是交易史上最伟大的人物理查德·D·威科夫（Richard D. Wyckoff）。
+你需要对我提供的股票行情数据进行大师级的专业分析。
+请严格遵循以下JSON格式输出你的分析结果，不要输出任何Markdown代码块标记（如 ```json），直接输出JSON字符串。
+
+JSON输出格式要求：
+{
+    "analysis_text": "这里写你的威科夫语气分析报告，使用中文，包含对背景、阶段、关键行为的详细解读...",
+    "market_phase": "当前所处阶段 (如 Phase A / Phase B / 吸筹 / 派发 / 上升趋势)",
+    "phases": [
+        {
+            "name": "吸筹区/派发区/交易区间",
+            "start_date": "YYYY-MM-DD",
+            "end_date": "YYYY-MM-DD",
+            "top_price": 15.5,
+            "bottom_price": 12.0,
+            "type": "accumulation" (或 distribution / neutral)
+        }
+    ],
+    "events": [
+        {
+            "date": "YYYY-MM-DD",
+            "type": "SC/ST/Spring/LPS/SOS/UTAD/SOW",
+            "description": "简短说明理由"
+        }
+    ]
+}"""
+            system_prompt = st.text_area("🤖 角色设定 (System Prompt)", value=default_system_prompt, height=300, help="定义 AI 的角色和输出格式，通常不需要修改")
+            
+        with c2:
+            default_user_prompt = """请重点分析当前的量价结构：
+1. 是否出现恐慌抛售(SC)或抢购高潮(BC)？
+2. 当前是吸筹还是派发？
+3. 对未来一周的走势做出预测。"""
+            custom_prompt = st.text_area("✍️ 补充指令 (User Prompt)", value=default_user_prompt, height=150)
+        
+        btn_analyze = st.button("🧠 开始威科夫分析", width="stretch", type="primary")
+
+    # 执行分析逻辑
+    if btn_analyze:
+        if not api_key:
+            st.error("请先配置 Gemini API Key")
+            return
+            
+        with st.spinner("🕵️‍♂️ 正在寻找该股票..."):
+            # 1. 模糊搜索
+            ts_code, name = engine.fuzzy_search_stock(stock_input)
+            if not ts_code:
+                st.error(f"未找到股票: {stock_input}")
+                return
+            
+        with st.spinner(f"📥 正在拉取 {name}({ts_code}) 的历史数据..."):
+            # 2. 获取数据
+            df = engine.get_stock_data_for_llm(ts_code, days=days_input)
+            if df.empty:
+                st.error("获取数据失败，请检查 Tushare Token 或网络")
+                return
+                
+        with st.spinner("🤖 威科夫大师正在读图思考 (调用 Gemini)..."):
+            # 3. 调用 LLM
+            client = StockLLMClient()
+            # 如果是临时输入的 Key，手动注入 (虽然 client 是单例，但这里简单处理)
+            if not GEMINI_API_KEY and api_key:
+                try:
+                    import google.genai as genai
+                except ImportError:
+                    try:
+                        from google import genai
+                    except ImportError:
+                        st.error("无法导入 google.genai 库")
+                        return
+                        
+                client.client = genai.Client(api_key=api_key)
+                client.api_available = True
+
+            result = client.analyze_stock(f"{name}({ts_code})", df, custom_prompt, system_prompt)
+            
+            if "error" in result:
+                st.error(result["error"])
+                if "raw_response" in result:
+                    with st.expander("查看原始返回"):
+                        st.code(result["raw_response"])
+            else:
+                st.session_state.stock_analysis_result = {
+                    "data": df,
+                    "ai_result": result,
+                    "info": {"code": ts_code, "name": name}
+                }
+                st.rerun()
+
+    # 展示结果
+    res = st.session_state.stock_analysis_result
+    if res:
+        info = res['info']
+        ai_res = res['ai_result']
+        df = res['data']
+        
+        st.divider()
+        st.markdown(f"### 📊 {info['name']} ({info['code']}) - 威科夫结构图")
+        
+        # 1. 绘图
+        fig = plot_wyckoff_chart(df, ai_res, info['name'])
+        st.plotly_chart(fig, width="stretch")
+        
+        # 2. 报告
+        st.markdown("### 📜 威科夫大师诊断报告")
+        st.markdown(f"""
+        <div style="background-color:#f8f9fa; padding:20px; border-radius:10px; border-left: 5px solid #d62728;">
+            {ai_res.get('analysis_text', '大师没有留下任何文字...')}
+        </div>
+        """, unsafe_allow_html=True)
+        
+        # 3. 调试信息 (可选)
+        with st.expander("查看原始 JSON 数据"):
+            st.json(ai_res)
+
+
+# ==========================================
+# Tab 1: 日内·量能
 # ==========================================
 st.markdown("""
 <style>
@@ -84,7 +262,7 @@ def render_volume_analysis():
         fig.add_trace(go.Scatter(x=df_pt['hhmm'], y=df_pt['cumsum'], name="今日", fill='tozeroy', line=dict(color='#d62728')))
         fig.update_xaxes(type='category', categoryarray=std_times, nticks=8, showspikes=True, spikemode='across', spikesnap='cursor')
         fig.update_layout(height=350, margin=dict(l=0,r=0,t=10,b=0), hovermode="x unified", legend=dict(orientation="h", y=1.1))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
     
     with c_table:
         rows = []
@@ -93,7 +271,7 @@ def render_volume_analysis():
             d = (t-y)/y*100 if y>0 and t>0 else 0
             icon = "🔥" if d>10 else ("❄️" if d<-10 else "")
             rows.append({"节点":k, "昨日":f"{y:,.0f}", "今日":f"{t:,.0f}" if t else "⏳", "幅度":f"{icon} {d:+.1f}%" if t else "-"})
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
 def render_volume_stock_picker():
     """成交量选股子Tab"""
@@ -135,7 +313,7 @@ def render_volume_stock_picker():
     
     with col_btn:
         st.write("")  # 占位
-        if st.button("🔍 开始筛选", use_container_width=True, key="btn_volume_pick"):
+        if st.button("🔍 开始筛选", width="stretch", key="btn_volume_pick"):
             is_realtime = screen_mode.startswith("实时")
             mode_desc = "实时模式（AkShare全市场优先）" if is_realtime else "收盘模式（全市场）"
             with st.spinner(f"正在筛选个股({mode_desc})..."):
@@ -164,7 +342,7 @@ def render_volume_stock_picker():
             st.success(f"✅ {mode_text}筛选完成，共找到 {len(result_df)} 只个股")
             st.dataframe(
                 result_df,
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
                 height=1300,
                 column_config={
@@ -209,7 +387,7 @@ def render_macro_timing():
             help="仅今日：更新今天的数据（快速）\n全量重建：重新2019年至今所有数据（慢但完整）"
         )
     with col_btn:
-        if st.button("📊 数据更新", use_container_width=True):
+        if st.button("📊 数据更新", width="stretch"):
             if macro_update_mode == "仅今日":
                 with st.spinner("正在更新今日数据..."):
                     engine.update_today_breadth()
@@ -386,7 +564,7 @@ def render_macro_timing():
         legend=dict(orientation="h", y=1.02, x=0.5, xanchor="center"),
         hovermode="x unified"
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
 def render_futures_analysis():
     """期指监控子Tab"""
@@ -463,7 +641,7 @@ def render_futures_analysis():
         
         st.dataframe(
             df_contracts,
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             column_config={
                 '合约代码': st.column_config.TextColumn('合约代码', width="small"),
@@ -510,7 +688,7 @@ def render_sector_tab():
             help="增量更新：仅更新新增交易日（快速）\n全量重建：重新计算所有数据（慢但完整）"
         )
     with col_btn:
-        if st.button("🔄 更新今日数据", use_container_width=True):
+        if st.button("🔄 更新今日数据", width="stretch"):
             is_incremental = (update_mode == "增量更新")
             with st.spinner(f"{'增量更新' if is_incremental else '全量重建'}中(含复权+精准行业，约{'10-30秒' if is_incremental else '1-3分钟'})..."):
                 engine.update_sector_breadth(lookback_days=250, incremental=is_incremental)
@@ -567,12 +745,12 @@ def render_sector_tab():
             tickfont=dict(size=12)
         )
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
     
     with st.expander("查看详细数据表"):
         df_grid = pd.DataFrame(z_values, index=sectors, columns=dates)
         # 【修改】因为 dates 已经是倒序的了，这里直接显示即可，不需要再 [::-1]
-        st.dataframe(df_grid.style.background_gradient(cmap='RdYlGn_r', axis=None), use_container_width=True)
+        st.dataframe(df_grid.style.background_gradient(cmap='RdYlGn_r', axis=None), width="stretch")
 
 # ==========================================
 # Tab 4: 策略·实验室
@@ -596,7 +774,7 @@ def render_strategy_tab():
                 help="增量更新：仅获取新增交易日数据（推荐）\n全量重建：重新下载近1.5年所有数据"
             )
         with col_etf_btn:
-            if st.button("🔄 同步ETF数据", key="btn_etf_refresh", use_container_width=True):
+            if st.button("🔄 同步ETF数据", key="btn_etf_refresh", width="stretch"):
                 is_incremental = (etf_update_mode == "增量更新")
                 with st.spinner(f"{'增量' if is_incremental else '全量'}刷新 ETF 行情 (含复权计算)..."):
                     engine.update_strategy_data(incremental=is_incremental)
@@ -639,7 +817,7 @@ def render_strategy_tab():
                         "策略B (因子分)", format="%.2f", min_value=-3, max_value=3
                     ),
                 },
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
                 height=800
             )
@@ -704,7 +882,7 @@ def render_strategy_tab():
             }
             st.dataframe(
                 display_conv,
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
                 height=600,
                 column_config=col_cfg
@@ -762,7 +940,7 @@ def render_strategy_tab():
             }
             st.dataframe(
                 display_cb,
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
                 height=600,
                 column_config=col_cfg_cb
@@ -771,11 +949,13 @@ def render_strategy_tab():
 
 def main():
     st.title("📈 AlphaMonitor Pro")
-    tab1, tab2, tab3, tab4 = st.tabs(["日内", "宏观", "板块", "策略"])
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["日内", "宏观", "板块", "资金曲线", "量化策略", "个股"])
     with tab1: render_intraday_tab()
     with tab2: render_macro_tab()
     with tab3: render_sector_tab()
-    with tab4: render_strategy_tab()
+    with tab4: render_capital_tab()      # 新增：资金曲线
+    with tab5: render_strategies_tab()   # 新增：量化策略（整合Info+Xueqiu）
+    with tab6: render_stock_tab()        # 原Tab 5
 
 if __name__ == "__main__":
     main()

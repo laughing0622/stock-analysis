@@ -118,12 +118,21 @@ def process_chunk(index_name, index_code, start_date, end_date, all_stocks_set=N
                 df_d = df_d[['ts_code', 'trade_date', 'close', 'pct_chg']]
                 df_f = df_f[['ts_code', 'trade_date', 'adj_factor']]
                 
-                # Exclude basic data
-                df_b = pro.daily_basic(ts_code=codes_str, start_date=real_start_date, end_date=end_date, fields='ts_code,trade_date,turnover_rate')
-                
+                # 获取每日基础数据 (换手率)
+                # 注意：daily_basic接口批量查询会返回空数据，需要逐个查询
+                all_basic = []
+                for code in batch:
+                    try:
+                        df_b = pro.daily_basic(ts_code=code, start_date=real_start_date, end_date=end_date, fields='ts_code,trade_date,turnover_rate')
+                        if not df_b.empty:
+                            all_basic.append(df_b)
+                    except:
+                        pass
+
                 df_m = pd.merge(df_d, df_f, on=['ts_code', 'trade_date'], how='inner')
-                if not df_b.empty:
-                    df_m = pd.merge(df_m, df_b, on=['ts_code', 'trade_date'], how='left')
+                if all_basic:
+                    df_b_all = pd.concat(all_basic)
+                    df_m = pd.merge(df_m, df_b_all, on=['ts_code', 'trade_date'], how='left')
                     df_m['turnover_rate'] = df_m['turnover_rate'].fillna(0)
                 else:
                     df_m['turnover_rate'] = 0.0
@@ -211,12 +220,14 @@ def calculate_crowd_index(pro, trade_date):
 
 def run_full_backfill():
     # === 配置区域 ===
-    START_DATE = '20190101'
-    from datetime import datetime
+    # 临时修改：只回填最近3个月数据（验证修复效果）
+    from datetime import datetime, timedelta
+    START_DATE = (datetime.now() - timedelta(days=90)).strftime('%Y%m%d')  # 最近3个月
     END_DATE   = datetime.now().strftime('%Y%m%d')
+    # 全量回填时使用: START_DATE = '20190101'
     # =============
-    
-    print(f" 启动全量回填任务: {START_DATE} ~ {END_DATE}")
+
+    print(f" 启动回填任务: {START_DATE} ~ {END_DATE} (最近3个月验证)")
     
     conn = sqlite3.connect(DB_PATH)
     intervals = get_quarters(START_DATE, END_DATE)

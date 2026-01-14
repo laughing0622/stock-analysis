@@ -8,7 +8,10 @@ import requests
 import json
 from datetime import datetime, timedelta
 from db_manager import db
-from tasks.strategy_algo import StrategyAlgo
+# from tasks.strategy_algo import StrategyAlgo
+from utils.symbol_standard import normalize_to_std
+
+
 
 # 1. 环境适配
 # 【修复乱码】移除强制编码设置，让系统自动适配 Windows/Mac 终端默认编码
@@ -212,9 +215,14 @@ class DataEngine:
                         all_adj_data.append(df_adj)
                     
                     # 3. 获取每日指标数据 (turnover_rate)
-                    df_basic = pro.daily_basic(ts_code=','.join(batch_stocks), start_date=start_date, end_date=end_date, fields='ts_code,trade_date,turnover_rate')
-                    if not df_basic.empty:
-                        all_basic_data.append(df_basic)
+                    # 注意：daily_basic接口批量查询会返回空数据，需要逐个查询
+                    for stock_code in batch_stocks:
+                        try:
+                            df_basic = pro.daily_basic(ts_code=stock_code, start_date=start_date, end_date=end_date, fields='ts_code,trade_date,turnover_rate')
+                            if not df_basic.empty:
+                                all_basic_data.append(df_basic)
+                        except:
+                            pass  # 换手率数据获取失败不影响其他指标
                 except Exception as e:
                     print(f"   -> 第 {i//batch_size+1} 批数据拉取失败: {e}")
                     continue
@@ -571,6 +579,14 @@ class DataEngine:
                     start_date = dates_sorted[0]
                     end_date = dates_sorted[-1]
                     dates_ui = dates_to_update
+
+                    # 【关键修复】增量更新时，需要额外拉取历史数据来计算MA20
+                    # 从第一个需要更新的日期往前推25个交易日（MA20需要20天，多留几天余量）
+                    buffer_days = 25
+                    if start_date in all_cal:
+                        idx = all_cal.index(start_date)
+                        start_date = all_cal[max(0, idx - buffer_days)]
+                        print(f"   为了计算MA20，实际拉取从 {start_date} 开始的数据")
                 else:
                     # 数据库为空，执行全量初始化
                     print("   数据库为空，执行全量初始化...")
@@ -693,7 +709,7 @@ class DataEngine:
             save(map_l1, 'level1')
             save(map_l2, 'level2')
             conn.commit()
-            print(f"   ✅ {'增量' if incremental else '全量'}更新完成")
+            print(f"   [OK] {'增量' if incremental else '全量'}更新完成")
         finally:
             conn.close()
 
@@ -887,8 +903,11 @@ class DataEngine:
             parsed = []
             for item in rows:
                 cell = item.get('cell', {})
+                # 标准化代码
+                raw_code = item.get('id')
+                std_code = normalize_to_std(raw_code)
                 parsed.append({
-                    'stock_code': item.get('id'),
+                    'stock_code': std_code,
                     'stock_name': cell.get('stock_nm'),
                     'issue_size': float(cell.get('amount', 0) or 0),
                     'bond_ratio': float(cell.get('cb_amount', 0) or 0),
@@ -1071,7 +1090,7 @@ class DataEngine:
             return {"df": pd.DataFrame(), "counts": {"raw": raw_cnt, "usable": 0}}
 
         df = df.copy()
-        df['bond_id'] = df['bond_id'].astype(str)
+        df['bond_id'] = df['bond_id'].astype(str).apply(normalize_to_std)
         df['increase_rt'] = pd.to_numeric(df['increase_rt'], errors='coerce')
         df['price'] = pd.to_numeric(df['price'], errors='coerce')
         df['premium_rt'] = pd.to_numeric(df['premium_rt'], errors='coerce')
@@ -1170,6 +1189,7 @@ class DataEngine:
             name_map = dict(zip(df_names['ts_code'], df_names['name']))
         except: name_map = {}
         
+        from tasks.strategy_algo import StrategyAlgo
         algo = StrategyAlgo()
         res = []
         pool = STRATEGY_POOL['ALL']
@@ -1543,6 +1563,104 @@ class DataEngine:
             print(f"获取个股数据异常 {ts_code}: {e}")
             return pd.DataFrame()
 
+    def fuzzy_search_stock(self, keyword):
+        """
+        模糊搜索股票：支持代码(自动补后缀)和名称(中文)
+        返回: (ts_code, name) 或 (None, None)
+        """
+        keyword = str(keyword).strip()
+        if not keyword: return None, None
+
+        try:
+            # 1. 如果是纯数字，尝试补全后缀
+            if keyword.isdigit() and len(keyword) == 6:
+                ts_code = normalize_to_std(keyword)
+                
+                # 验证是否存在
+                df = pro.stock_basic(ts_code=ts_code, fields='ts_code,name')
+                if not df.empty:
+                    return df.iloc[0]['ts_code'], df.iloc[0]['name']
+            
+            # 2. 如果不是代码，或者是代码但没搜到，或者是非6位数字，进行全名匹配
+            # 这里的缓存机制很简单：首次加载全量列表（只有几千行，很快）
+            if not hasattr(self, '_stock_basic_cache'):
+                print(">> [Data] 加载全市场股票列表用于搜索...")
+                self._stock_basic_cache = pro.stock_basic(fields='ts_code,symbol,name', list_status='L')
+            
+            df_all = self._stock_basic_cache
+            
+            # 优先精确匹配名称
+            match = df_all[df_all['name'] == keyword]
+            if not match.empty:
+                return match.iloc[0]['ts_code'], match.iloc[0]['name']
+            
+            # 其次包含匹配名称
+            match = df_all[df_all['name'].str.contains(keyword)]
+            if not match.empty:
+                # 返回市值最大的那个？或者第一个。这里简单返回第一个
+                return match.iloc[0]['ts_code'], match.iloc[0]['name']
+                
+            # 再次尝试匹配 symbol (比如输入 600519 但没输后缀)
+            match = df_all[df_all['symbol'] == keyword]
+            if not match.empty:
+                return match.iloc[0]['ts_code'], match.iloc[0]['name']
+
+            return None, None
+            
+        except Exception as e:
+            print(f"搜索股票异常: {e}")
+            return None, None
+
+    def get_stock_data_for_llm(self, ts_code, days=365):
+        """
+        获取投喂给 LLM 的全量数据
+        包含：OHLCV, MA(5,10,20,30,60,120,200,250), VMA20
+        """
+        try:
+            # 多取 300 天用于计算长期均线
+            real_days = days + 300
+            end_date = datetime.now().strftime('%Y%m%d')
+            start_date = (datetime.now() - timedelta(days=real_days)).strftime('%Y%m%d')
+            
+            # 1. 获取日线 (不复权？威科夫通常看复权后的连续K线，这里统一用前复权)
+            df = pro.daily(ts_code=ts_code, start_date=start_date, end_date=end_date)
+            if df.empty: return pd.DataFrame()
+            
+            # 2. 复权因子
+            df_adj = pro.adj_factor(ts_code=ts_code, start_date=start_date, end_date=end_date)
+            if not df_adj.empty:
+                df = df.merge(df_adj, on=['ts_code','trade_date'], how='left')
+                df['adj_factor'] = df['adj_factor'].fillna(method='ffill').fillna(1.0)
+                latest_adj = df['adj_factor'].iloc[0] # tushare返回是倒序的，第一行是最新
+                
+                # 计算前复权
+                for col in ['open','high','low','close']:
+                    df[col] = df[col] * df['adj_factor'] / latest_adj
+            
+            # 3. 排序 (旧 -> 新) 用于计算均线
+            df = df.sort_values('trade_date').reset_index(drop=True)
+            
+            # 4. 计算均线指标
+            ma_list = [5, 10, 20, 30, 50, 60, 120, 200, 250]
+            for ma in ma_list:
+                df[f'MA{ma}'] = df['close'].rolling(ma).mean()
+            
+            df['VMA20'] = df['vol'].rolling(20).mean()
+            
+            # 5. 截取用户请求的最近 N 天
+            df_final = df.iloc[-days:].copy()
+            
+            # 6. 格式化日期
+            df_final['date'] = pd.to_datetime(df_final['trade_date']).dt.strftime('%Y-%m-%d')
+            
+            # 7. 保留给 LLM 的列
+            cols = ['date', 'open', 'high', 'low', 'close', 'vol', 'VMA20'] + [f'MA{ma}' for ma in ma_list]
+            return df_final[cols]
+            
+        except Exception as e:
+            print(f"LLM数据获取异常: {e}")
+            return pd.DataFrame()
+
     # ==========================================
     # 模块 G: 成交量选股
     # ==========================================
@@ -1738,17 +1856,8 @@ class DataEngine:
             df_past_avg.columns = ['ts_code', 'avg_amount_5d']
     
             # 5. 处理实时数据：不同来源统一为 ts_code + 千元 amount
-            def convert_to_ts_code(code: str) -> str:
-                code = str(code).zfill(6)
-                if code.startswith('6'):
-                    return f"{code}.SH"
-                elif code.startswith(('0', '3')):
-                    return f"{code}.SZ"
-                elif code.startswith(('4', '8')):
-                    return f"{code}.BJ"
-                else:
-                    return f"{code}.SH"  # 默认上海
-    
+            # 使用统一的标准化函数
+            
             if source == "akshare":
                 # AkShare: 代码列为 '代码' 或 'symbol'，成交额列为 '成交额'（单位：元）
                 code_col = '代码' if '代码' in df_realtime.columns else ('symbol' if 'symbol' in df_realtime.columns else None)
@@ -1757,12 +1866,12 @@ class DataEngine:
                 if code_col is None or amt_col is None or name_col is None:
                     print("[实时模式] AkShare 实时数据字段不完整，缺少 代码/名称/成交额")
                     return pd.DataFrame()
-                df_realtime['ts_code'] = df_realtime[code_col].astype(str).apply(convert_to_ts_code)
+                df_realtime['ts_code'] = df_realtime[code_col].astype(str).apply(normalize_to_std)
                 df_realtime['amount'] = pd.to_numeric(df_realtime[amt_col], errors='coerce').fillna(0) / 1000.0  # 元 -> 千元
                 df_realtime['名称'] = df_realtime[name_col].astype(str)
             else:
                 # qstock: 代码 / 名称 / 成交额(元)
-                df_realtime['ts_code'] = df_realtime['代码'].astype(str).apply(convert_to_ts_code)
+                df_realtime['ts_code'] = df_realtime['代码'].astype(str).apply(normalize_to_std)
                 df_realtime['amount'] = pd.to_numeric(df_realtime['成交额'], errors='coerce').fillna(0) / 1000.0
     
             # 6. 合并实时数据和历史均值

@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(schtasks /query:*)",
+      "Bash(powershell -Command:*)",
+      "Bash(cmd.exe /c \"schtasks /query /fo LIST | findstr /i \"\"stock data quant python\"\"\")",
+      "Bash(python:*)",
+      "Bash(timeout 30 python:*)",
+      "WebSearch",
+      "Bash(tasklist:*)",
+      "Bash(findstr:*)"
+    ]
+  }
+}

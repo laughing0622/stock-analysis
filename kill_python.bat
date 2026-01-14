@@ -1,0 +1,6 @@
+@echo off
+echo 正在终止所有Python进程...
+taskkill /F /IM python.exe
+echo.
+echo 已完成！请按任意键继续...
+pause

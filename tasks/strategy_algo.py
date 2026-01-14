@@ -1,7 +1,7 @@
 import pandas as pd
 import numpy as np
 import math
-from sklearn.linear_model import LinearRegression
+# from sklearn.linear_model import LinearRegression # Lazy imported
 
 class StrategyAlgo:
     """
@@ -116,6 +116,7 @@ class StrategyAlgo:
             if np.isnan(y).any() or np.isinf(y).any():
                 return None
             
+            from sklearn.linear_model import LinearRegression
             lr = LinearRegression()
             lr.fit(x, y)
             bias_s = lr.coef_[0] * 10000
@@ -137,6 +138,8 @@ class StrategyAlgo:
             if np.isnan(y_slope).any() or np.isinf(y_slope).any():
                 return None
             
+            # LinearRegression already imported above or here
+            from sklearn.linear_model import LinearRegression
             lr_slope = LinearRegression()
             lr_slope.fit(x_slope, y_slope)
             slope = lr_slope.coef_[0]
