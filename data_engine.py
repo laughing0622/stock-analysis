@@ -189,15 +189,36 @@ class DataEngine:
             end_date = trade_date
             start_date = (datetime.strptime(trade_date, '%Y%m%d') - timedelta(days=25)).strftime('%Y%m%d')  # 多取5天作为缓冲
             
-            # 按批次处理成分股，每批最多1000个
-            batch_size = 1000
-            all_data = []
-            
+            # 优化：提前批量拉取 daily_basic (按日期全市场拉取)
+            # 相比逐个拉取成分股(1000次+)，这种方式只需要调用 天数(25次) 接口
+            print(f"   -> 预加载全市场换手率数据 ({start_date} ~ {end_date})...")
+            df_basic_all = pd.DataFrame()
+            try:
+                # 获取该范围内所有交易日
+                cal = pro.trade_cal(exchange='SSE', is_open='1', start_date=start_date, end_date=end_date)
+                date_list = cal['cal_date'].tolist()
+                
+                basic_list = []
+                for d in date_list:
+                    try:
+                        # 获取全市场数据
+                        df_b = pro.daily_basic(trade_date=d, fields='ts_code,trade_date,turnover_rate')
+                        if not df_b.empty:
+                            basic_list.append(df_b)
+                        time.sleep(0.05) # 防流控
+                    except:
+                        pass
+                
+                if basic_list:
+                    df_basic_all = pd.concat(basic_list)
+                    print(f"      成功加载 {len(df_basic_all)} 条换手率数据")
+            except Exception as e:
+                print(f"   -> 预加载换手率失败: {e}")
+
             # 按批次处理成分股，每批最多500个（同时拉取daily和adj_factor）
             batch_size = 500
             all_daily_data = []
             all_adj_data = []
-            all_basic_data = []
             
             for i in range(0, len(stock_list), batch_size):
                 batch_stocks = stock_list[i:i+batch_size]
@@ -214,15 +235,8 @@ class DataEngine:
                     if not df_adj.empty:
                         all_adj_data.append(df_adj)
                     
-                    # 3. 获取每日指标数据 (turnover_rate)
-                    # 注意：daily_basic接口批量查询会返回空数据，需要逐个查询
-                    for stock_code in batch_stocks:
-                        try:
-                            df_basic = pro.daily_basic(ts_code=stock_code, start_date=start_date, end_date=end_date, fields='ts_code,trade_date,turnover_rate')
-                            if not df_basic.empty:
-                                all_basic_data.append(df_basic)
-                        except:
-                            pass  # 换手率数据获取失败不影响其他指标
+                    # 3. 换手率数据已预加载，此处不再拉取
+                    
                 except Exception as e:
                     print(f"   -> 第 {i//batch_size+1} 批数据拉取失败: {e}")
                     continue
@@ -239,9 +253,8 @@ class DataEngine:
             df_d = pd.merge(df_daily, df_adj, on=['ts_code', 'trade_date'], how='inner')
             
             # 合并基础数据
-            if all_basic_data:
-                df_basic = pd.concat(all_basic_data)
-                df_d = pd.merge(df_d, df_basic, on=['ts_code', 'trade_date'], how='left')
+            if not df_basic_all.empty:
+                df_d = pd.merge(df_d, df_basic_all, on=['ts_code', 'trade_date'], how='left')
                 df_d['turnover_rate'] = df_d['turnover_rate'].fillna(0)
             else:
                 df_d['turnover_rate'] = 0.0
