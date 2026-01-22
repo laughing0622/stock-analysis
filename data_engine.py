@@ -415,6 +415,104 @@ class DataEngine:
         conn.close()
         return df
 
+    def update_breadth_incremental(self, start_date=None, max_gap_days=7):
+        """
+        增量更新宏观择时数据
+        Args:
+            start_date: 手动指定开始日期(用于补漏)，默认为数据库最新日期+1
+            max_gap_days: 最大允许补漏天数，防止意外大量API调用
+        """
+        print(">> [Macro] 开始增量更新...")
+        conn = db.get_conn()
+
+        try:
+            # 1. 确定更新日期范围
+            if start_date is None:
+                latest_query = "SELECT MAX(trade_date) as max_date FROM market_breadth"
+                df_latest = pd.read_sql(latest_query, conn)
+                latest_date = df_latest.iloc[0]['max_date']
+
+                if latest_date:
+                    start_date = (datetime.strptime(latest_date, '%Y%m%d') + timedelta(days=1)).strftime('%Y%m%d')
+                    print(f"   数据库最新日期: {latest_date}")
+                else:
+                    print("   数据库为空，需要先执行全量初始化")
+                    conn.close()
+                    return
+
+            # 2. 获取交易日历
+            end_date = datetime.now().strftime('%Y%m%d')
+            trade_dates = self.get_trade_cal(days=500)
+
+            # 3. 筛选需要更新的交易日
+            dates_to_update = [d for d in trade_dates if d >= start_date and d <= end_date]
+
+            if not dates_to_update:
+                print("   ✅ 数据已是最新，无需更新")
+                conn.close()
+                return
+
+            # 4. 检查是否超过最大补漏天数
+            if len(dates_to_update) > max_gap_days:
+                print(f"   ⚠️ 需要更新的天数({len(dates_to_update)})超过限制({max_gap_days}天)，请检查数据或手动指定start_date")
+                conn.close()
+                return
+
+            print(f"   需要更新 {len(dates_to_update)} 个交易日: {dates_to_update[0]} ~ {dates_to_update[-1]}")
+
+            # 5. 批量更新每个交易日
+            success_count = 0
+            for i, trade_date in enumerate(dates_to_update):
+                print(f"   处理第 {i+1}/{len(dates_to_update)} 天: {trade_date}")
+
+                try:
+                    # 计算拥挤度
+                    crowd_index = self.calculate_crowd_index(trade_date)
+
+                    # 处理所有指数
+                    for name, code in INDEX_MAP.items():
+                        try:
+                            # 获取指数收盘价
+                            if code == '932000.CSI':
+                                df_idx = pro.index_daily(ts_code=code, start_date=trade_date, end_date=trade_date)
+                            else:
+                                df_idx = pro.index_daily(ts_code=code, trade_date=trade_date)
+
+                            if df_idx.empty:
+                                continue
+
+                            # 计算市场指标
+                            pct_above_ma20, pct_down_3days, pct_turnover_lt_3, pct_turnover_gt_5 = \
+                                self.calculate_market_indicators(code, name, trade_date)
+
+                            # 插入或更新数据
+                            conn.execute('INSERT OR REPLACE INTO market_breadth VALUES (?,?,?,?,?,?,?,?,?)',
+                                         (trade_date, code, name, float(df_idx.iloc[0]['close']),
+                                          pct_above_ma20, pct_down_3days, crowd_index,
+                                          pct_turnover_lt_3, pct_turnover_gt_5))
+                        except Exception as e:
+                            print(f"      -> {name} 更新失败: {e}")
+                            continue
+
+                    success_count += 1
+
+                    # 每5个交易日提交一次，避免事务过大
+                    if (i + 1) % 5 == 0:
+                        conn.commit()
+                        print(f"      已提交 {success_count}/{i+1} 天")
+
+                except Exception as e:
+                    print(f"   处理 {trade_date} 失败: {e}")
+                    continue
+
+            conn.commit()
+            print(f"\n✅ 增量更新完成，成功更新 {success_count}/{len(dates_to_update)} 天")
+
+        except Exception as e:
+            print(f"\n❌ 增量更新异常: {e}")
+        finally:
+            conn.close()
+
     # ==========================================
     # 模块 B: 日内监控
     # ==========================================
@@ -449,18 +547,96 @@ class DataEngine:
             print(f"   拉取{symbol}失败: {e}")
         return pd.DataFrame()
 
-    def get_minute_data_analysis(self):
+    def get_minute_data_analysis(self, force_refresh=False):
+        """
+        获取分钟数据分析
+        Args:
+            force_refresh: 强制刷新今日数据，忽略缓存
+        """
+        today = datetime.now().strftime('%Y%m%d')
+
+        # 检查今日数据是否已存在
+        if not force_refresh:
+            conn = db.get_conn()
+            try:
+                df_check = pd.read_sql(f"SELECT * FROM daily_nodes WHERE trade_date='{today}'", conn)
+                if not df_check.empty:
+                    print(f">> [Intraday] 今日 {today} 数据已存在，使用缓存")
+                    conn.close()
+                    return self._load_minute_data_from_db(today)
+            except Exception as e:
+                print(f"   检查缓存失败: {e}")
+            finally:
+                conn.close()
+
         print(f">> [Intraday] 同步分钟数据...")
         df_sh = self._fetch_sina_kline("sh000001")
         df_sz = self._fetch_sina_kline("sz399001")
         if df_sh.empty or df_sz.empty: return None
-        
+
+    def _load_minute_data_from_db(self, date_str):
+        """从数据库加载分钟数据"""
+        conn = db.get_conn()
+        try:
+            # 获取当日节点数据
+            df_nodes = pd.read_sql(f"SELECT * FROM daily_nodes WHERE trade_date='{date_str}'", conn)
+            if df_nodes.empty:
+                return None
+
+            row = df_nodes.iloc[0]
+            today_nodes = {
+                '竞价/开盘': row['node_open'],
+                '15分钟': row['node_15'],
+                '30分钟': row['node_30'],
+                '60分钟': row['node_60'],
+                '午盘': row['node_lunch'],
+                '收盘': row['node_close']
+            }
+
+            # 获取昨日节点数据
+            date_obj = datetime.strptime(date_str, '%Y%m%d').date()
+            prev_date_obj = date_obj - timedelta(days=1)
+            df_prev = pd.read_sql(f"SELECT * FROM daily_nodes WHERE trade_date='{prev_date_obj.strftime('%Y%m%d')}'", conn)
+
+            yesterday_nodes = {}
+            if not df_prev.empty:
+                prev_row = df_prev.iloc[0]
+                yesterday_nodes = {
+                    '竞价/开盘': prev_row['node_open'],
+                    '15分钟': prev_row['node_15'],
+                    '30分钟': prev_row['node_30'],
+                    '60分钟': prev_row['node_60'],
+                    '午盘': prev_row['node_lunch'],
+                    '收盘': prev_row['node_close']
+                }
+
+            return {
+                "yesterday_date": prev_date_obj.strftime('%Y-%m-%d') if yesterday_nodes else "无",
+                "today_date": date_str,
+                "yesterday_nodes": yesterday_nodes,
+                "today_nodes": today_nodes,
+                "yesterday_curve": pd.DataFrame(columns=['hhmm', 'cumsum']),
+                "today_curve": pd.DataFrame(columns=['hhmm', 'cumsum'])
+            }
+        except Exception as e:
+            print(f"   从数据库加载数据失败: {e}")
+            return None
+        finally:
+            conn.close()
+
+    def get_minute_data_analysis_old(self):
+        """原版获取分钟数据分析（保留用于对比）"""
+        print(f">> [Intraday] 同步分钟数据...")
+        df_sh = self._fetch_sina_kline("sh000001")
+        df_sz = self._fetch_sina_kline("sz399001")
+        if df_sh.empty or df_sz.empty: return None
+
         df_m = pd.merge(df_sh, df_sz, on='time', how='inner', suffixes=('_sh', '_sz'))
         df_m['amt'] = df_m['amt_100m_sh'] + df_m['amt_100m_sz']
-        
+
         all_dates = sorted(df_m['time'].dt.date.unique())
         if not all_dates: return None
-        
+
         curr, last = datetime.now().date(), all_dates[-1]
         t_d = curr if last < curr else last
         # 计算上个交易日
@@ -481,7 +657,7 @@ class DataEngine:
             y_d = t_d - timedelta(days=1)
         finally:
             conn.close()
-        
+
         # 使用昨日官方全市场成交额对新浪数据做口径校准
         try:
             y_str = y_d.strftime('%Y%m%d') if hasattr(y_d, 'strftime') else str(y_d).replace('-', '')
@@ -495,7 +671,7 @@ class DataEngine:
                     print(f"   [Intraday] 校准系数: {scale:.4f}, 昨日官方:{official_amt:.1f}亿, 原始:{raw_amt:.1f}亿")
         except Exception as e:
             print(f"   [Intraday] 校准成交额失败: {e}")
-        
+
         df_t = df_m[df_m['time'].dt.date == t_d].copy() if last >= curr else pd.DataFrame(columns=['time','amt'])
         df_y = df_m[df_m['time'].dt.date == y_d].copy() if y_d in all_dates else pd.DataFrame(columns=['time','amt'])
 
@@ -526,13 +702,13 @@ class DataEngine:
         # 如果昨日节点仍为空，保证为字典，防止显示错误
         if not yn:
             yn = {}
-                
+
         # 2. 处理今日数据
         tn, tc = calc_nodes(df_t, str(t_d))
         # 只有当有实际成交量时才保存今日数据
         if any(tn.values()):
             self._save_daily_nodes(str(t_d), tn)
-            
+
         return {"yesterday_date": str(y_d) if y_d else "无", "today_date": str(t_d),
                 "yesterday_nodes": yn, "today_nodes": tn, "yesterday_curve": yc, "today_curve": tc}
 
@@ -1509,7 +1685,120 @@ class DataEngine:
                 lines.append("检测到合约间调仓，但总净单下降")
         
         return " | ".join(lines)
-    
+
+    def update_futures_holdings_history(self, start_date=None, max_gap_days=7):
+        """
+        增量更新期指持仓历史数据
+        Args:
+            start_date: 手动指定开始日期，默认为数据库最新日期+1
+            max_gap_days: 最大允许补漏天数
+        """
+        print(">> [Futures] 开始增量更新持仓历史...")
+        conn = db.get_conn()
+
+        try:
+            # 1. 确定更新日期范围
+            if start_date is None:
+                latest_query = "SELECT MAX(trade_date) as max_date FROM futures_holdings_history"
+                df_latest = pd.read_sql(latest_query, conn)
+                latest_date = df_latest.iloc[0]['max_date']
+
+                if latest_date:
+                    start_date = (datetime.strptime(latest_date, '%Y%m%d') + timedelta(days=1)).strftime('%Y%m%d')
+                    print(f"   数据库最新日期: {latest_date}")
+                else:
+                    print("   数据库为空，从最近60个交易日开始")
+                    trade_dates = self.get_trade_cal(days=60)
+                    if not trade_dates:
+                        conn.close()
+                        return
+                    start_date = trade_dates[0]
+
+            # 2. 获取交易日历
+            end_date = datetime.now().strftime('%Y%m%d')
+            trade_dates = self.get_trade_cal(days=500)
+
+            # 3. 筛选需要更新的交易日
+            dates_to_update = [d for d in trade_dates if d >= start_date and d <= end_date]
+
+            if not dates_to_update:
+                print("   ✅ 期指数据已是最新，无需更新")
+                conn.close()
+                return
+
+            # 4. 检查是否超过最大补漏天数
+            if len(dates_to_update) > max_gap_days:
+                print(f"   ⚠️ 需要更新的天数({len(dates_to_update)})超过限制({max_gap_days}天)")
+                conn.close()
+                return
+
+            print(f"   需要更新 {len(dates_to_update)} 个交易日: {dates_to_update[0]} ~ {dates_to_update[-1]}")
+
+            # 5. 批量更新每个交易日
+            success_count = 0
+            for i, trade_date in enumerate(dates_to_update):
+                print(f"   处理第 {i+1}/{len(dates_to_update)} 天: {trade_date}")
+
+                try:
+                    # 获取当日持仓数据
+                    data = self.get_futures_holdings(trade_date)
+                    if not data:
+                        print(f"      当日无数据，跳过")
+                        continue
+
+                    # 获取前一交易日持仓数据
+                    if i == 0:
+                        # 如果是第一天，需要单独获取前一日的数据
+                        prev_date = None
+                        idx = trade_dates.index(trade_date)
+                        if idx > 0:
+                            prev_date = trade_dates[idx - 1]
+                    else:
+                        prev_date = dates_to_update[i - 1]
+
+                    if prev_date:
+                        data_prev = self.get_futures_holdings(prev_date)
+                    else:
+                        data_prev = {}
+
+                    # 存储当日数据
+                    for variety, info in data.items():
+                        for contract in info['contracts']:
+                            symbol = contract['symbol']
+                            net = contract['net']
+
+                            # 计算变化量
+                            change_net = 0
+                            if prev_date and variety in data_prev:
+                                prev_contracts = {c['symbol']: c['net'] for c in data_prev[variety]['contracts']}
+                                prev_net = prev_contracts.get(symbol, 0)
+                                change_net = net - prev_net
+
+                            # 插入或更新数据
+                            conn.execute(
+                                'INSERT OR REPLACE INTO futures_holdings_history VALUES (?,?,?,?,?,?)',
+                                (trade_date, variety, symbol, net, 0, change_net)
+                            )
+
+                    success_count += 1
+
+                    # 每3个交易日提交一次
+                    if (i + 1) % 3 == 0:
+                        conn.commit()
+                        print(f"      已提交 {success_count}/{i+1} 天")
+
+                except Exception as e:
+                    print(f"   处理 {trade_date} 失败: {e}")
+                    continue
+
+            conn.commit()
+            print(f"\n✅ 期指持仓历史增量更新完成，成功更新 {success_count}/{len(dates_to_update)} 天")
+
+        except Exception as e:
+            print(f"\n❌ 期指持仓历史增量更新异常: {e}")
+        finally:
+            conn.close()
+
     def get_stock_daily(self, ts_code, days=250):
         """
         获取个股日线数据（复权后）

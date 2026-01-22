@@ -64,8 +64,28 @@ class DBManager:
         c.execute('''CREATE TABLE IF NOT EXISTS etf_daily (
             ts_code TEXT,
             trade_date TEXT,
-            open REAL, high REAL, low REAL, close REAL, vol REAL,
+            open REAL, high REAL, low REAL, close REAL, vol REAL, adj_factor REAL,
             PRIMARY KEY (ts_code, trade_date)
+        )''')
+
+        # 检查是否需要添加adj_factor字段
+        try:
+            c.execute("PRAGMA table_info(etf_daily)")
+            columns = [col[1] for col in c.fetchall()]
+            if 'adj_factor' not in columns:
+                c.execute("ALTER TABLE etf_daily ADD COLUMN adj_factor REAL DEFAULT 1.0")
+        except Exception as e:
+            print(f"添加adj_factor字段时出错: {e}")
+
+        # 5. [新增] 期指持仓历史表 (用于期指监控历史分析)
+        c.execute('''CREATE TABLE IF NOT EXISTS futures_holdings_history (
+            trade_date TEXT,
+            variety TEXT,
+            symbol TEXT,
+            net_long INTEGER,
+            net_short INTEGER,
+            change_net INTEGER,
+            PRIMARY KEY (trade_date, variety, symbol)
         )''')
 
         conn.commit()

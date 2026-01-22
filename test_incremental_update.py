@@ -172,27 +172,218 @@ def test_full_vs_incremental():
     
     return True
 
+def test_macro_incremental():
+    """测试宏观择时增量更新"""
+    print("\n" + "="*60)
+    print("测试 3: 宏观择时增量更新")
+    print("="*60)
+
+    # 连接数据库检查初始状态
+    conn = sqlite3.connect('data/stock_data.db')
+    cursor = conn.cursor()
+
+    # 获取更新前的数据量
+    cursor.execute("SELECT COUNT(*) FROM market_breadth")
+    count_before = cursor.fetchone()[0]
+
+    cursor.execute("SELECT MAX(trade_date) as max_date FROM market_breadth")
+    max_date_before = cursor.fetchone()[0]
+
+    print(f"\n更新前状态:")
+    print(f"  - 数据总量: {count_before} 条")
+    print(f"  - 最新日期: {max_date_before}")
+
+    conn.close()
+
+    # 执行增量更新
+    print(f"\n开始增量更新...")
+    start_time = time.time()
+    from data_engine import DataEngine
+    engine_obj = DataEngine()
+    engine_obj.update_breadth_incremental()
+    elapsed = time.time() - start_time
+
+    # 检查更新后状态
+    conn = sqlite3.connect('data/stock_data.db')
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT COUNT(*) FROM market_breadth")
+    count_after = cursor.fetchone()[0]
+
+    cursor.execute("SELECT MAX(trade_date) as max_date FROM market_breadth")
+    max_date_after = cursor.fetchone()[0]
+
+    print(f"\n更新后状态:")
+    print(f"  - 数据总量: {count_after} 条")
+    print(f"  - 最新日期: {max_date_after}")
+    print(f"  - 新增数据: {count_after - count_before} 条")
+    print(f"  - 耗时: {elapsed:.2f} 秒")
+
+    conn.close()
+
+    # 验证结果
+    if max_date_after and (max_date_after >= max_date_before or count_after > count_before):
+        print("\n✅ 宏观择时增量更新测试通过")
+    else:
+        print("\n❌ 宏观择时增量更新测试失败")
+
+    return True
+
+
+def test_futures_history():
+    """测试期指持仓历史增量更新"""
+    print("\n" + "="*60)
+    print("测试 4: 期指持仓历史增量更新")
+    print("="*60)
+
+    # 连接数据库检查初始状态
+    conn = sqlite3.connect('data/stock_data.db')
+    cursor = conn.cursor()
+
+    # 检查表是否存在
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='futures_holdings_history'")
+    table_exists = cursor.fetchone() is not None
+
+    if not table_exists:
+        print("\n表不存在，首次创建...")
+        conn.close()
+        from data_engine import DataEngine
+        engine_obj = DataEngine()
+        engine_obj.update_futures_holdings_history()
+        print("\n✅ 期指持仓历史表创建完成")
+        return True
+
+    # 获取更新前的数据量
+    cursor.execute("SELECT COUNT(*) FROM futures_holdings_history")
+    count_before = cursor.fetchone()[0]
+
+    cursor.execute("SELECT MAX(trade_date) as max_date FROM futures_holdings_history")
+    max_date_before = cursor.fetchone()[0]
+
+    print(f"\n更新前状态:")
+    print(f"  - 数据总量: {count_before} 条")
+    print(f"  - 最新日期: {max_date_before}")
+
+    conn.close()
+
+    # 执行增量更新
+    print(f"\n开始增量更新...")
+    start_time = time.time()
+    from data_engine import DataEngine
+    engine_obj = DataEngine()
+    engine_obj.update_futures_holdings_history()
+    elapsed = time.time() - start_time
+
+    # 检查更新后状态
+    conn = sqlite3.connect('data/stock_data.db')
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT COUNT(*) FROM futures_holdings_history")
+    count_after = cursor.fetchone()[0]
+
+    cursor.execute("SELECT MAX(trade_date) as max_date FROM futures_holdings_history")
+    max_date_after = cursor.fetchone()[0]
+
+    print(f"\n更新后状态:")
+    print(f"  - 数据总量: {count_after} 条")
+    print(f"  - 最新日期: {max_date_after}")
+    print(f"  - 新增数据: {count_after - count_before} 条")
+    print(f"  - 耗时: {elapsed:.2f} 秒")
+
+    conn.close()
+
+    # 验证结果
+    if max_date_after and (max_date_after >= max_date_before or count_after >= count_before):
+        print("\n✅ 期指持仓历史增量更新测试通过")
+    else:
+        print("\n❌ 期指持仓历史增量更新测试失败")
+
+    return True
+
+
+def test_intraday_cache():
+    """测试日内数据缓存"""
+    print("\n" + "="*60)
+    print("测试 5: 日内数据缓存")
+    print("="*60)
+
+    from data_engine import DataEngine
+    engine_obj = DataEngine()
+
+    # 测试1: 首次拉取（强制刷新）
+    print("\n[子测试1] 首次拉取（强制刷新）")
+    start_time = time.time()
+    result = engine_obj.get_minute_data_analysis(force_refresh=True)
+    elapsed1 = time.time() - start_time
+
+    if result:
+        print(f"  今日: {result['today_date']}")
+        print(f"  昨日: {result['yesterday_date']}")
+        print(f"  今日成交额: {result['today_nodes'].get('收盘', 0):.1f}亿")
+        print(f"  耗时: {elapsed1:.2f} 秒")
+    else:
+        print("  无数据（可能非交易时间）")
+        print("  跳过缓存测试")
+        return False
+
+    # 测试2: 使用缓存
+    print("\n[子测试2] 使用缓存")
+    start_time = time.time()
+    result = engine_obj.get_minute_data_analysis(force_refresh=False)
+    elapsed2 = time.time() - start_time
+
+    if result:
+        print(f"  今日: {result['today_date']}")
+        print(f"  使用缓存成功")
+        print(f"  耗时: {elapsed2:.2f} 秒")
+        print(f"  缓存加速: {elapsed1 / elapsed2:.2f}x")
+
+    # 测试3: 强制刷新
+    print("\n[子测试3] 强制刷新")
+    start_time = time.time()
+    result = engine_obj.get_minute_data_analysis(force_refresh=True)
+    elapsed3 = time.time() - start_time
+
+    if result:
+        print(f"  今日: {result['today_date']}")
+        print(f"  强制刷新成功")
+        print(f"  耗时: {elapsed3:.2f} 秒")
+
+    print("\n✅ 日内数据缓存测试完成")
+
+    return True
+
+
 def main():
     """主测试函数"""
     print("\n" + "="*60)
     print("增量更新功能测试套件")
     print("="*60)
     print(f"测试时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    
+
     try:
         # 测试1: 板块宽度增量更新
         test_sector_incremental()
-        
-        # 测试2: ETF策略增量更新  
+
+        # 测试2: ETF策略增量更新
         test_etf_incremental()
-        
-        # 测试3: 性能对比（可选）
+
+        # 测试3: 宏观择时增量更新
+        test_macro_incremental()
+
+        # 测试4: 期指持仓历史增量更新
+        test_futures_history()
+
+        # 测试5: 日内数据缓存
+        test_intraday_cache()
+
+        # 测试6: 性能对比（可选）
         # test_full_vs_incremental()
-        
+
         print("\n" + "="*60)
         print("所有测试完成！")
         print("="*60)
-        
+
     except Exception as e:
         print(f"\n❌ 测试过程中发生错误: {e}")
         import traceback

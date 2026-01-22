@@ -381,14 +381,18 @@ def render_macro_timing():
     with col_mode:
         macro_update_mode = st.selectbox(
             "macro_mode_selector",
-            ["仅今日", "全量重建"],
+            ["增量更新", "仅今日", "全量重建"],
             key="macro_update_mode",
             label_visibility="collapsed",
-            help="仅今日：更新今天的数据（快速）\n全量重建：重新2019年至今所有数据（慢但完整）"
+            help="增量更新：补充缺失的交易日数据（推荐）\n仅今日：只更新今天的数据\n全量重建：重新2019年至今所有数据（慢但完整）"
         )
     with col_btn:
         if st.button("📊 数据更新", width="stretch"):
-            if macro_update_mode == "仅今日":
+            if macro_update_mode == "增量更新":
+                with st.spinner("正在增量更新数据..."):
+                    engine.update_breadth_incremental()
+                st.success("✅ 增量更新完成")
+            elif macro_update_mode == "仅今日":
                 with st.spinner("正在更新今日数据..."):
                     engine.update_today_breadth()
                 st.success("✅ 今日数据更新完成")
@@ -569,9 +573,17 @@ def render_macro_timing():
 def render_futures_analysis():
     """期指监控子Tab"""
     # 顶部刷新按钮
-    if st.button("🔄 刷新期指数据", key="btn_futures_refresh"):
-        st.rerun()
-    
+    col_refresh, col_update = st.columns([1, 1])
+    with col_refresh:
+        if st.button("🔄 刷新今日", key="btn_futures_refresh"):
+            st.rerun()
+    with col_update:
+        if st.button("📊 更新历史", key="btn_futures_history"):
+            with st.spinner("正在增量更新期指持仓历史..."):
+                engine.update_futures_holdings_history()
+            st.success("✅ 期指持仓历史更新完成")
+            st.rerun()
+
     # 获取日期
     with st.spinner("获取交易日期..."):
         target_date, prev_date = engine.get_futures_smart_date()
