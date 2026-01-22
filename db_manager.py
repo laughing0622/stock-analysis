@@ -17,6 +17,12 @@ class DBManager:
 
     def _init_tables(self):
         conn = self.get_conn()
+        # 开启 WAL 模式 (大幅提升并发性能，允许同时读写)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL;")
+        except:
+            pass
+            
         c = conn.cursor()
         
         # 1. 日内节点 (原有)

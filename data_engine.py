@@ -350,63 +350,74 @@ class DataEngine:
             conn.close()
     
     def update_today_breadth(self):
-        """更新所有指数的数据，包括：
-        1. 更新今日数据
-        """
+        """更新所有指数的数据（优化版：计算与写入分离）"""
         print(">> [Macro] 开始数据更新...")
         
         # 目标日期：今天
         target_date = datetime.now().strftime('%Y%m%d')
-        conn = db.get_conn()
         
+        # 1. 检查交易日 (不占数据库)
         try:
-            # 检查今天是否是交易日
-            try:
-                df_cal = pro.trade_cal(exchange='SSE', is_open='1', start_date=target_date, end_date=target_date)
-                if df_cal.empty:
-                    print(f"   {target_date} 不是交易日，跳过更新")
-                    return
-            except:
-                pass
-            
-            # 计算今日的拥挤度（所有指数共用）
+            df_cal = pro.trade_cal(exchange='SSE', is_open='1', start_date=target_date, end_date=target_date)
+            if df_cal.empty:
+                print(f"   {target_date} 不是交易日，跳过更新")
+                return
+        except:
+            pass
+        
+        # 2. 计算阶段 (无数据库锁)
+        data_to_save = []
+        try:
+            # 计算今日的拥挤度
             crowd_index = self.calculate_crowd_index(target_date)
             
             # 处理所有指数
             for name, code in INDEX_MAP.items():
-                print(f"   更新 {name} 今日数据...")
+                print(f"   [计算中] {name} ...")
                 try:
-                    # 获取指数收盘价，特殊处理中证2000指数
-                    if code == '932000.CSI':  # 中证2000
-                        # 中证2000指数可能没有足够的历史数据，使用更宽松的时间范围
+                    # 获取指数收盘价
+                    if code == '932000.CSI':
                         df_idx = pro.index_daily(ts_code=code, start_date=target_date, end_date=target_date)
                     else:
-                        # 其他指数正常处理
                         df_idx = pro.index_daily(ts_code=code, trade_date=target_date)
                     
                     if df_idx.empty:
                         print(f"   -> {name} 无今日行情数据")
                         continue
                     
-                    # 计算真实的市场宽度和恐慌情绪
-                    pct_above_ma20, pct_down_3days, pct_turnover_lt_3, pct_turnover_gt_5 = self.calculate_market_indicators(code, name, target_date)
+                    # 核心计算
+                    pct_above_ma20, pct_down_3days, pct_turnover_lt_3, pct_turnover_gt_5 = \
+                        self.calculate_market_indicators(code, name, target_date)
                     
-                    # 插入或更新数据
-                    conn.execute('INSERT OR REPLACE INTO market_breadth VALUES (?,?,?,?,?,?,?,?,?)', 
-                                (target_date, code, name, float(df_idx.iloc[0]['close']), 
-                                 pct_above_ma20, pct_down_3days, crowd_index,
-                                 pct_turnover_lt_3, pct_turnover_gt_5))
-                    print(f"   -> {name} 今日数据更新完成")
+                    data_to_save.append((
+                        target_date, code, name, float(df_idx.iloc[0]['close']), 
+                        pct_above_ma20, pct_down_3days, crowd_index,
+                        pct_turnover_lt_3, pct_turnover_gt_5
+                    ))
                 except Exception as e:
-                    print(f"   -> {name} 更新异常: {e}")
+                    print(f"   -> {name} 计算异常: {e}")
                     continue
-            
-            conn.commit()
-            print(f"\n✅ 所有指数今日数据更新完成")
         except Exception as e:
-            print(f"\n❌ 今日数据更新异常: {e}")
-        finally:
-            conn.close()
+            print(f"\n❌ 计算过程异常: {e}")
+            return
+
+        # 3. 写入阶段 (快速写入)
+        if data_to_save:
+            print(f"   [写入中] 正在保存 {len(data_to_save)} 条数据...")
+            conn = db.get_conn()
+            try:
+                conn.executemany(
+                    'INSERT OR REPLACE INTO market_breadth VALUES (?,?,?,?,?,?,?,?,?)', 
+                    data_to_save
+                )
+                conn.commit()
+                print(f"\n✅ 所有指数今日数据更新完成")
+            except Exception as e:
+                print(f"\n❌ 数据库写入异常: {e}")
+            finally:
+                conn.close()
+        else:
+            print("⚠️ 未生成有效数据")
 
     def get_breadth_data(self, index_name):
         conn = db.get_conn()
@@ -416,105 +427,106 @@ class DataEngine:
 
     def update_breadth_incremental(self, start_date=None, max_gap_days=7):
         """
-        增量更新宏观择时数据
+        增量更新宏观择时数据 (优化版：计算与写入分离)
         Args:
-            start_date: 手动指定开始日期(用于补漏)，默认为数据库最新日期+1
-            max_gap_days: 最大允许补漏天数，防止意外大量API调用
+            start_date: 手动指定开始日期
+            max_gap_days: 最大允许补漏天数
         """
         print(">> [Macro] 开始增量更新...")
+        
+        # 1. 快速获取最新日期（用完即关，不占连接）
         conn = db.get_conn()
-
         try:
-            # 1. 确定更新日期范围
             if start_date is None:
                 latest_query = "SELECT MAX(trade_date) as max_date FROM market_breadth"
                 df_latest = pd.read_sql(latest_query, conn)
                 latest_date = df_latest.iloc[0]['max_date']
-
+                
                 if latest_date:
                     start_date = (datetime.strptime(latest_date, '%Y%m%d') + timedelta(days=1)).strftime('%Y%m%d')
                     print(f"   数据库最新日期: {latest_date}")
                 else:
                     print("   数据库为空，需要先执行全量初始化")
-                    conn.close()
                     return
-
-            # 2. 获取交易日历
-            end_date = datetime.now().strftime('%Y%m%d')
-            trade_dates = self.get_trade_cal(days=500)
-
-            # 3. 筛选需要更新的交易日
-            dates_to_update = [d for d in trade_dates if d >= start_date and d <= end_date]
-
-            if not dates_to_update:
-                print("   ✅ 数据已是最新，无需更新")
-                conn.close()
-                return
-
-            # 4. 检查是否超过最大补漏天数
-            if len(dates_to_update) > max_gap_days:
-                error_msg = f"需要更新的天数({len(dates_to_update)})超过限制({max_gap_days}天)，请使用'全量重建'或增大max_gap_days参数"
-                print(f"   ⚠️ {error_msg}")
-                print(f"   提示: 数据库最新日期为{start_date}，建议执行全量重建")
-                conn.close()
-                return False
-
-            print(f"   需要更新 {len(dates_to_update)} 个交易日: {dates_to_update[0]} ~ {dates_to_update[-1]}")
-
-            # 5. 批量更新每个交易日
-            success_count = 0
-            for i, trade_date in enumerate(dates_to_update):
-                print(f"   处理第 {i+1}/{len(dates_to_update)} 天: {trade_date}")
-
-                try:
-                    # 计算拥挤度
-                    crowd_index = self.calculate_crowd_index(trade_date)
-
-                    # 处理所有指数
-                    for name, code in INDEX_MAP.items():
-                        try:
-                            # 获取指数收盘价
-                            if code == '932000.CSI':
-                                df_idx = pro.index_daily(ts_code=code, start_date=trade_date, end_date=trade_date)
-                            else:
-                                df_idx = pro.index_daily(ts_code=code, trade_date=trade_date)
-
-                            if df_idx.empty:
-                                continue
-
-                            # 计算市场指标
-                            pct_above_ma20, pct_down_3days, pct_turnover_lt_3, pct_turnover_gt_5 = \
-                                self.calculate_market_indicators(code, name, trade_date)
-
-                            # 插入或更新数据
-                            conn.execute('INSERT OR REPLACE INTO market_breadth VALUES (?,?,?,?,?,?,?,?,?)',
-                                         (trade_date, code, name, float(df_idx.iloc[0]['close']),
-                                          pct_above_ma20, pct_down_3days, crowd_index,
-                                          pct_turnover_lt_3, pct_turnover_gt_5))
-                        except Exception as e:
-                            print(f"      -> {name} 更新失败: {e}")
-                            continue
-
-                    success_count += 1
-
-                    # 每5个交易日提交一次，避免事务过大
-                    if (i + 1) % 5 == 0:
-                        conn.commit()
-                        print(f"      已提交 {success_count}/{i+1} 天")
-
-                except Exception as e:
-                    print(f"   处理 {trade_date} 失败: {e}")
-                    continue
-
-            conn.commit()
-            print(f"\n✅ 增量更新完成，成功更新 {success_count}/{len(dates_to_update)} 天")
-            return True
-
-        except Exception as e:
-            print(f"\n❌ 增量更新异常: {e}")
-            return False
         finally:
             conn.close()
+
+        # 2. 计算需要更新的日期
+        end_date = datetime.now().strftime('%Y%m%d')
+        trade_dates = self.get_trade_cal(days=500)
+        dates_to_update = [d for d in trade_dates if d >= start_date and d <= end_date]
+
+        if not dates_to_update:
+            print("   ✅ 数据已是最新，无需更新")
+            return
+
+        # 检查天数限制
+        if len(dates_to_update) > max_gap_days:
+            error_msg = f"需要更新的天数({len(dates_to_update)})超过限制({max_gap_days}天)，请使用'全量重建'或增大max_gap_days参数"
+            print(f"   ⚠️ {error_msg}")
+            return False
+
+        print(f"   需要更新 {len(dates_to_update)} 个交易日: {dates_to_update[0]} ~ {dates_to_update[-1]}")
+
+        # 3. 阶段一：纯计算（不连接数据库，完全避免锁）
+        data_buffer = []
+        for i, trade_date in enumerate(dates_to_update):
+            print(f"   [计算中 {i+1}/{len(dates_to_update)}] 处理 {trade_date} ...")
+            
+            try:
+                # 计算拥挤度
+                crowd_index = self.calculate_crowd_index(trade_date)
+
+                # 计算各指数指标
+                for name, code in INDEX_MAP.items():
+                    try:
+                        # 获取指数收盘价
+                        if code == '932000.CSI':
+                            df_idx = pro.index_daily(ts_code=code, start_date=trade_date, end_date=trade_date)
+                        else:
+                            df_idx = pro.index_daily(ts_code=code, trade_date=trade_date)
+
+                        if df_idx.empty:
+                            continue
+
+                        # 核心计算 (最耗时的部分)
+                        pct_above_ma20, pct_down_3days, pct_turnover_lt_3, pct_turnover_gt_5 = \
+                            self.calculate_market_indicators(code, name, trade_date)
+
+                        # 暂存结果到内存
+                        data_buffer.append((
+                            trade_date, code, name, float(df_idx.iloc[0]['close']),
+                            pct_above_ma20, pct_down_3days, crowd_index,
+                            pct_turnover_lt_3, pct_turnover_gt_5
+                        ))
+                    except Exception as e:
+                        print(f"      -> {name} 计算失败: {e}")
+                        continue
+            
+            except Exception as e:
+                print(f"   处理 {trade_date} 失败: {e}")
+                continue
+
+        # 4. 阶段二：批量写入（极速完成）
+        if data_buffer:
+            print(f"   [写入中] 正在将 {len(data_buffer)} 条数据写入数据库...")
+            conn = db.get_conn()
+            try:
+                conn.executemany(
+                    'INSERT OR REPLACE INTO market_breadth VALUES (?,?,?,?,?,?,?,?,?)', 
+                    data_buffer
+                )
+                conn.commit()
+                print(f"\n✅ 增量更新完成，成功写入 {len(data_buffer)} 条记录")
+                return True
+            except Exception as e:
+                print(f"\n❌ 数据库写入失败: {e}")
+                return False
+            finally:
+                conn.close()
+        else:
+            print("\n⚠️ 未生成有效数据，无写入")
+            return False
 
     # ==========================================
     # 模块 B: 日内监控
@@ -541,11 +553,18 @@ class DataEngine:
             if res:
                 df = pd.DataFrame(res)
                 df['time'] = pd.to_datetime(df['day'])
-                df['vol_hand'] = pd.to_numeric(df['volume'], errors='coerce')
-                df['close'] = pd.to_numeric(df['close'], errors='coerce')
-                # 成交额(亿元) = 手数 * 收盘价 * 100 / 1e8
-                df['amt_100m'] = df['vol_hand'] * df['close'] * 100 / 1e8
-                return df[['time', 'vol_hand', 'amt_100m']]
+                
+                # 优先使用 amount 字段 (元)
+                if 'amount' in df.columns:
+                    df['amount'] = pd.to_numeric(df['amount'], errors='coerce')
+                    df['amt_100m'] = df['amount'] / 1e8
+                else:
+                    # 降级方案：用 volume 估算 (仅适用于个股，指数不准确)
+                    df['vol_hand'] = pd.to_numeric(df['volume'], errors='coerce')
+                    df['close'] = pd.to_numeric(df['close'], errors='coerce')
+                    df['amt_100m'] = df['vol_hand'] * df['close'] * 100 / 1e8
+                
+                return df[['time', 'amt_100m']]
         except Exception as e:
             print(f"   拉取{symbol}失败: {e}")
         return pd.DataFrame()
