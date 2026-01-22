@@ -189,31 +189,17 @@ class DataEngine:
             end_date = trade_date
             start_date = (datetime.strptime(trade_date, '%Y%m%d') - timedelta(days=25)).strftime('%Y%m%d')  # 多取5天作为缓冲
             
-            # 优化：提前批量拉取 daily_basic (按日期全市场拉取)
-            # 相比逐个拉取成分股(1000次+)，这种方式只需要调用 天数(25次) 接口
-            print(f"   -> 预加载全市场换手率数据 ({start_date} ~ {end_date})...")
+            # 优化：只拉取目标日期的 daily_basic (按日期全市场拉取)
+            # 不需要拉取 start_date ~ end_date，因为换手率判断只看当日
+            print(f"   -> 拉取当日全市场换手率数据 ({trade_date})...")
             df_basic_all = pd.DataFrame()
             try:
-                # 获取该范围内所有交易日
-                cal = pro.trade_cal(exchange='SSE', is_open='1', start_date=start_date, end_date=end_date)
-                date_list = cal['cal_date'].tolist()
-                
-                basic_list = []
-                for d in date_list:
-                    try:
-                        # 获取全市场数据
-                        df_b = pro.daily_basic(trade_date=d, fields='ts_code,trade_date,turnover_rate')
-                        if not df_b.empty:
-                            basic_list.append(df_b)
-                        time.sleep(0.05) # 防流控
-                    except:
-                        pass
-                
-                if basic_list:
-                    df_basic_all = pd.concat(basic_list)
+                # directly fetch daily_basic for the target trade_date
+                df_basic_all = pro.daily_basic(trade_date=trade_date, fields='ts_code,trade_date,turnover_rate')
+                if not df_basic_all.empty:
                     print(f"      成功加载 {len(df_basic_all)} 条换手率数据")
             except Exception as e:
-                print(f"   -> 预加载换手率失败: {e}")
+                print(f"   -> 拉取换手率失败: {e}")
 
             # 按批次处理成分股，每批最多500个（同时拉取daily和adj_factor）
             batch_size = 500
