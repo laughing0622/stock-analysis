@@ -454,9 +454,11 @@ class DataEngine:
 
             # 4. 检查是否超过最大补漏天数
             if len(dates_to_update) > max_gap_days:
-                print(f"   ⚠️ 需要更新的天数({len(dates_to_update)})超过限制({max_gap_days}天)，请检查数据或手动指定start_date")
+                error_msg = f"需要更新的天数({len(dates_to_update)})超过限制({max_gap_days}天)，请使用'全量重建'或增大max_gap_days参数"
+                print(f"   ⚠️ {error_msg}")
+                print(f"   提示: 数据库最新日期为{start_date}，建议执行全量重建")
                 conn.close()
-                return
+                return False
 
             print(f"   需要更新 {len(dates_to_update)} 个交易日: {dates_to_update[0]} ~ {dates_to_update[-1]}")
 
@@ -507,9 +509,11 @@ class DataEngine:
 
             conn.commit()
             print(f"\n✅ 增量更新完成，成功更新 {success_count}/{len(dates_to_update)} 天")
+            return True
 
         except Exception as e:
             print(f"\n❌ 增量更新异常: {e}")
+            return False
         finally:
             conn.close()
 
@@ -1728,9 +1732,11 @@ class DataEngine:
 
             # 4. 检查是否超过最大补漏天数
             if len(dates_to_update) > max_gap_days:
-                print(f"   ⚠️ 需要更新的天数({len(dates_to_update)})超过限制({max_gap_days}天)")
+                error_msg = f"需要更新的天数({len(dates_to_update)})超过限制({max_gap_days}天)，请使用'全量重建'或增大max_gap_days参数"
+                print(f"   ⚠️ {error_msg}")
+                print(f"   提示: 数据库最新日期为{start_date}，建议执行全量重建")
                 conn.close()
-                return
+                return False
 
             print(f"   需要更新 {len(dates_to_update)} 个交易日: {dates_to_update[0]} ~ {dates_to_update[-1]}")
 
@@ -1793,9 +1799,11 @@ class DataEngine:
 
             conn.commit()
             print(f"\n✅ 期指持仓历史增量更新完成，成功更新 {success_count}/{len(dates_to_update)} 天")
+            return True
 
         except Exception as e:
             print(f"\n❌ 期指持仓历史增量更新异常: {e}")
+            return False
         finally:
             conn.close()
 

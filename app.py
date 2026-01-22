@@ -390,7 +390,7 @@ def render_macro_timing():
         if st.button("📊 数据更新", width="stretch"):
             if macro_update_mode == "增量更新":
                 with st.spinner("正在增量更新数据..."):
-                    engine.update_breadth_incremental()
+                    engine.update_breadth_incremental(max_gap_days=30)
                 st.success("✅ 增量更新完成")
             elif macro_update_mode == "仅今日":
                 with st.spinner("正在更新今日数据..."):
