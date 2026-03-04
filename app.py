@@ -485,9 +485,9 @@ def render_macro_timing():
         row_heights=[0.7, 0.3], specs=[[{"secondary_y": True}], [{"secondary_y": False}]]
     )
 
-    # 主图
-    fig.add_trace(go.Scatter(x=df['date'], y=df['close'], name=f'{idx_name}', line=dict(color='#d62728', width=1.5)), row=1, col=1, secondary_y=False)
-    fig.add_trace(go.Scatter(x=df['date'], y=df['pct_down_3days'], name='恐慌情绪%', mode='lines', line=dict(color='#17becf', width=1.5)), row=1, col=1, secondary_y=True)
+    # 主图 (connectgaps=False: 不连接非交易日之间的缺口)
+    fig.add_trace(go.Scatter(x=df['date'], y=df['close'], name=f'{idx_name}', line=dict(color='#d62728', width=1.5), connectgaps=False), row=1, col=1, secondary_y=False)
+    fig.add_trace(go.Scatter(x=df['date'], y=df['pct_down_3days'], name='恐慌情绪%', mode='lines', line=dict(color='#17becf', width=1.5), connectgaps=False), row=1, col=1, secondary_y=True)
     
     # 新增：换手率指标 (默认关闭)
     if 'pct_turnover_lt_3' in df.columns:
@@ -495,15 +495,15 @@ def render_macro_timing():
         y_val_lt3 = 100 - df['pct_turnover_lt_3']
         # 添加9日均线平滑
         y_val_lt3_ma9 = y_val_lt3.rolling(window=9, min_periods=1).mean()
-        fig.add_trace(go.Scatter(x=df['date'], y=y_val_lt3_ma9, name='换手率>3%占比(9日均)', visible='legendonly', line=dict(color='#9467bd', width=1.5)), row=1, col=1, secondary_y=True)
+        fig.add_trace(go.Scatter(x=df['date'], y=y_val_lt3_ma9, name='换手率>3%占比(9日均)', visible='legendonly', line=dict(color='#9467bd', width=1.5), connectgaps=False), row=1, col=1, secondary_y=True)
     
     if 'pct_turnover_gt_5' in df.columns:
         # 添加9日均线平滑
         y_val_gt5_ma9 = df['pct_turnover_gt_5'].rolling(window=9, min_periods=1).mean()
-        fig.add_trace(go.Scatter(x=df['date'], y=y_val_gt5_ma9, name='换手率>5%占比(9日均)', visible='legendonly', line=dict(color='#bcbd22', width=1.5)), row=1, col=1, secondary_y=True)
+        fig.add_trace(go.Scatter(x=df['date'], y=y_val_gt5_ma9, name='换手率>5%占比(9日均)', visible='legendonly', line=dict(color='#bcbd22', width=1.5), connectgaps=False), row=1, col=1, secondary_y=True)
     
-    # 副图 (修复：移除 fill='tozeroy'，仅保留折线)
-    fig.add_trace(go.Scatter(x=df['date'], y=df['pct_above_ma20'], name='市场宽度%', line=dict(color='#2ca02c', width=1.5)), row=2, col=1)
+    # 副图 (修复：移除 fill='tozeroy'，仅保留折线, connectgaps=False: 不连接非交易日)
+    fig.add_trace(go.Scatter(x=df['date'], y=df['pct_above_ma20'], name='市场宽度%', line=dict(color='#2ca02c', width=1.5), connectgaps=False), row=2, col=1)
     
     # 参考线
     fig.add_hline(y=20, line_dash="dot", line_color="green", opacity=0.5, row=2, col=1)
