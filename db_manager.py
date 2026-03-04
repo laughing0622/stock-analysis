@@ -1,6 +1,11 @@
 import sqlite3
 import pandas as pd
-from config import DB_PATH
+import sys
+import os
+
+# 直接定义DB_PATH，避免导入冲突
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE_DIR, 'data', 'stock_data.db')
 
 class DBManager:
     def __init__(self):

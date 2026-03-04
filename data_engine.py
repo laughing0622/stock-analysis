@@ -8,7 +8,8 @@ import requests
 import json
 from datetime import datetime, timedelta
 from db_manager import db
-from tasks.strategy_algo import StrategyAlgo
+# from tasks.strategy_algo import StrategyAlgo
+
 
 # 1. 环境适配
 # 【修复乱码】移除强制编码设置，让系统自动适配 Windows/Mac 终端默认编码
@@ -212,9 +213,14 @@ class DataEngine:
                         all_adj_data.append(df_adj)
                     
                     # 3. 获取每日指标数据 (turnover_rate)
-                    df_basic = pro.daily_basic(ts_code=','.join(batch_stocks), start_date=start_date, end_date=end_date, fields='ts_code,trade_date,turnover_rate')
-                    if not df_basic.empty:
-                        all_basic_data.append(df_basic)
+                    # 注意：daily_basic接口批量查询会返回空数据，需要逐个查询
+                    for stock_code in batch_stocks:
+                        try:
+                            df_basic = pro.daily_basic(ts_code=stock_code, start_date=start_date, end_date=end_date, fields='ts_code,trade_date,turnover_rate')
+                            if not df_basic.empty:
+                                all_basic_data.append(df_basic)
+                        except:
+                            pass  # 换手率数据获取失败不影响其他指标
                 except Exception as e:
                     print(f"   -> 第 {i//batch_size+1} 批数据拉取失败: {e}")
                     continue
@@ -347,11 +353,11 @@ class DataEngine:
         1. 更新今日数据
         """
         print(">> [Macro] 开始数据更新...")
-        
+
         # 目标日期：今天
         target_date = datetime.now().strftime('%Y%m%d')
         conn = db.get_conn()
-        
+
         try:
             # 检查今天是否是交易日
             try:
@@ -361,10 +367,10 @@ class DataEngine:
                     return
             except:
                 pass
-            
+
             # 计算今日的拥挤度（所有指数共用）
             crowd_index = self.calculate_crowd_index(target_date)
-            
+
             # 处理所有指数
             for name, code in INDEX_MAP.items():
                 print(f"   更新 {name} 今日数据...")
@@ -376,28 +382,266 @@ class DataEngine:
                     else:
                         # 其他指数正常处理
                         df_idx = pro.index_daily(ts_code=code, trade_date=target_date)
-                    
+
                     if df_idx.empty:
                         print(f"   -> {name} 无今日行情数据")
                         continue
-                    
+
                     # 计算真实的市场宽度和恐慌情绪
                     pct_above_ma20, pct_down_3days, pct_turnover_lt_3, pct_turnover_gt_5 = self.calculate_market_indicators(code, name, target_date)
-                    
+
                     # 插入或更新数据
-                    conn.execute('INSERT OR REPLACE INTO market_breadth VALUES (?,?,?,?,?,?,?,?,?)', 
-                                (target_date, code, name, float(df_idx.iloc[0]['close']), 
+                    conn.execute('INSERT OR REPLACE INTO market_breadth VALUES (?,?,?,?,?,?,?,?,?)',
+                                (target_date, code, name, float(df_idx.iloc[0]['close']),
                                  pct_above_ma20, pct_down_3days, crowd_index,
                                  pct_turnover_lt_3, pct_turnover_gt_5))
                     print(f"   -> {name} 今日数据更新完成")
                 except Exception as e:
                     print(f"   -> {name} 更新异常: {e}")
                     continue
-            
+
             conn.commit()
             print(f"\n✅ 所有指数今日数据更新完成")
         except Exception as e:
             print(f"\n❌ 今日数据更新异常: {e}")
+        finally:
+            conn.close()
+
+    def update_breadth_incremental(self):
+        """增量更新所有指数的市场宽度数据
+
+        逻辑：
+        1. 查询数据库中每个指数的最新日期
+        2. 获取最新日期之后的所有交易日
+        3. 为计算 MA20，需要往前多拉取 25 天 buffer 数据
+        4. 对每个缺失日期计算指标并入库
+        """
+        print(">> [Macro] 开始增量数据更新...")
+
+        conn = db.get_conn()
+
+        try:
+            # 1. 获取交易日历（足够多的天数）
+            all_cal = self.get_trade_cal(days=500)
+            if not all_cal:
+                print("   ❌ 无法获取交易日历")
+                return
+
+            today = datetime.now().strftime('%Y%m%d')
+
+            # 2. 处理每个指数
+            for name, code in INDEX_MAP.items():
+                print(f"\n   === 处理 {name} ({code}) ===")
+
+                try:
+                    # 查询该指数的最新日期
+                    df_latest = pd.read_sql(
+                        f"SELECT MAX(trade_date) as max_date FROM market_breadth WHERE index_code='{code}'",
+                        conn
+                    )
+                    latest_date = df_latest.iloc[0]['max_date']
+
+                    if latest_date:
+                        print(f"   数据库最新日期: {latest_date}")
+
+                        # 找出需要更新的日期
+                        if latest_date in all_cal:
+                            idx = all_cal.index(latest_date)
+                            dates_to_update = all_cal[idx + 1:]
+                        else:
+                            dates_to_update = [d for d in all_cal if d > latest_date]
+
+                        # 过滤掉未来的日期（只更新到今天）
+                        dates_to_update = [d for d in dates_to_update if d <= today]
+
+                        if not dates_to_update:
+                            print(f"   ✅ {name} 数据已是最新")
+                            continue
+
+                        print(f"   需要增量更新 {len(dates_to_update)} 个交易日: {dates_to_update[0]} ~ {dates_to_update[-1]}")
+
+                        # 计算数据拉取范围（需要 buffer 来计算 MA20）
+                        first_date = dates_to_update[0]
+                        if first_date in all_cal:
+                            idx = all_cal.index(first_date)
+                            buffer_days = 25  # MA20 需要 20 天，多留几天余量
+                            start_date = all_cal[max(0, idx - buffer_days)]
+                        else:
+                            start_date = first_date
+
+                        end_date = dates_to_update[-1]
+                        print(f"   为计算 MA20，实际拉取从 {start_date} 开始的数据")
+
+                    else:
+                        # 数据库为空，初始化最近 250 个交易日
+                        print(f"   数据库为空，初始化最近数据...")
+                        dates_to_update = all_cal[-250:] if len(all_cal) >= 250 else all_cal
+                        dates_to_update = [d for d in dates_to_update if d <= today]
+
+                        if not dates_to_update:
+                            print(f"   ❌ 无可用交易日")
+                            continue
+
+                        # 全量初始化时，从最早日期开始拉取（已包含足够历史）
+                        start_date = dates_to_update[0]
+                        end_date = dates_to_update[-1]
+                        print(f"   初始化范围: {start_date} ~ {end_date} ({len(dates_to_update)} 个交易日)")
+
+                    # 3. 获取指数行情数据
+                    if code == '932000.CSI':  # 中证2000
+                        df_idx = pro.index_daily(ts_code=code, start_date=start_date, end_date=end_date)
+                    else:
+                        df_idx_list = []
+                        for d in dates_to_update:
+                            try:
+                                df_tmp = pro.index_daily(ts_code=code, trade_date=d)
+                                if not df_tmp.empty:
+                                    df_idx_list.append(df_tmp)
+                            except:
+                                pass
+                        df_idx = pd.concat(df_idx_list) if df_idx_list else pd.DataFrame()
+
+                    if df_idx.empty:
+                        print(f"   -> {name} 无指数行情数据")
+                        continue
+
+                    # 建立日期到收盘价的映射
+                    idx_prices = dict(zip(df_idx['trade_date'], df_idx['close']))
+
+                    # 4. 批量计算市场指标（一次拉取所有需要的数据）
+                    # 获取成分股
+                    stock_list = self._get_index_constituents(code, end_date)
+                    if not stock_list:
+                        print(f"   -> {name} 无成分股数据")
+                        continue
+
+                    print(f"   成分股数量: {len(stock_list)}")
+
+                    # 拉取成分股数据（含 buffer）
+                    all_daily_data = []
+                    all_adj_data = []
+                    all_basic_data = []
+
+                    batch_size = 500
+                    for i in range(0, len(stock_list), batch_size):
+                        batch_stocks = stock_list[i:i + batch_size]
+                        try:
+                            df_daily = pro.daily(ts_code=','.join(batch_stocks), start_date=start_date, end_date=end_date,
+                                                fields='ts_code,trade_date,close,pct_chg')
+                            if not df_daily.empty:
+                                all_daily_data.append(df_daily)
+
+                            df_adj = pro.adj_factor(ts_code=','.join(batch_stocks), start_date=start_date, end_date=end_date)
+                            if not df_adj.empty:
+                                all_adj_data.append(df_adj)
+
+                            # 换手率需要逐个查询
+                            for stock_code in batch_stocks:
+                                try:
+                                    df_basic = pro.daily_basic(ts_code=stock_code, start_date=start_date, end_date=end_date,
+                                                              fields='ts_code,trade_date,turnover_rate')
+                                    if not df_basic.empty:
+                                        all_basic_data.append(df_basic)
+                                except:
+                                    pass
+                        except Exception as e:
+                            print(f"   批次 {i // batch_size + 1} 拉取失败: {e}")
+                            continue
+
+                    if not all_daily_data or not all_adj_data:
+                        print(f"   -> {name} 无足够成分股数据")
+                        continue
+
+                    # 合并数据
+                    df_d = pd.concat(all_daily_data)
+                    df_adj = pd.concat(all_adj_data)
+                    df_d = pd.merge(df_d, df_adj, on=['ts_code', 'trade_date'], how='inner')
+
+                    if all_basic_data:
+                        df_basic = pd.concat(all_basic_data)
+                        df_d = pd.merge(df_d, df_basic, on=['ts_code', 'trade_date'], how='left')
+                        df_d['turnover_rate'] = df_d['turnover_rate'].fillna(0)
+                    else:
+                        df_d['turnover_rate'] = 0.0
+
+                    # 计算复权价和指标
+                    df_d['hfq_close'] = df_d['close'] * df_d['adj_factor']
+                    df_d = df_d.sort_values(['ts_code', 'trade_date'])
+
+                    # MA20
+                    df_d['ma20'] = df_d.groupby('ts_code')['hfq_close'].transform(
+                        lambda x: x.rolling(20, min_periods=10).mean())
+                    df_d['is_above_ma20'] = (df_d['hfq_close'] > df_d['ma20']).astype(int)
+
+                    # 连跌3日
+                    df_d['is_down'] = (df_d['pct_chg'] < 0)
+                    df_d['down_1'] = df_d.groupby('ts_code')['is_down'].shift(1)
+                    df_d['down_2'] = df_d.groupby('ts_code')['is_down'].shift(2)
+                    df_d['is_down_3days'] = (df_d['is_down'] & df_d['down_1'] & df_d['down_2']).astype(int)
+
+                    # 换手率指标
+                    df_d['is_turnover_lt_3'] = (df_d['turnover_rate'] < 3.0).astype(int)
+                    df_d['is_turnover_gt_5'] = (df_d['turnover_rate'] > 5.0).astype(int)
+
+                    # 5. 按日期计算并入库
+                    actual_counts = []  # 记录每日实际股票数量
+                    for target_date in dates_to_update:
+                        if target_date not in idx_prices:
+                            print(f"   -> {target_date} 无指数收盘价，跳过")
+                            continue
+
+                        df_target = df_d[df_d['trade_date'] == target_date].copy()
+                        if df_target.empty:
+                            continue
+
+                        valid_stocks = len(df_target)
+                        actual_counts.append(valid_stocks)
+                        pct_above_ma20 = (df_target['is_above_ma20'].sum() / valid_stocks) * 100 if valid_stocks > 0 else 0
+                        pct_down_3days = (df_target['is_down_3days'].sum() / valid_stocks) * 100 if valid_stocks > 0 else 0
+                        pct_turnover_lt_3 = (df_target['is_turnover_lt_3'].sum() / valid_stocks) * 100 if valid_stocks > 0 else 0
+                        pct_turnover_gt_5 = (df_target['is_turnover_gt_5'].sum() / valid_stocks) * 100 if valid_stocks > 0 else 0
+
+                        # 计算拥挤度
+                        crowd_index = self.calculate_crowd_index(target_date)
+
+                        # 入库
+                        conn.execute(
+                            'INSERT OR REPLACE INTO market_breadth VALUES (?,?,?,?,?,?,?,?,?)',
+                            (target_date, code, name, float(idx_prices[target_date]),
+                             pct_above_ma20, pct_down_3days, crowd_index,
+                             pct_turnover_lt_3, pct_turnover_gt_5)
+                        )
+
+                    # 数据质量校验
+                    if actual_counts:
+                        avg_count = sum(actual_counts) / len(actual_counts)
+                        expected_count = len(stock_list)
+                        coverage_ratio = avg_count / expected_count if expected_count > 0 else 0
+
+                        print(f"   -> {name} 增量更新完成 ({len(dates_to_update)} 个交易日)")
+                        print(f"      数据覆盖率: {coverage_ratio*100:.1f}% (平均 {int(avg_count)} 只/预期 {expected_count} 只)")
+
+                        if coverage_ratio < 0.8:
+                            print(f"      ⚠️ 警告: 数据覆盖率偏低，可能存在 API 限流或数据缺失问题")
+                        if coverage_ratio < 0.5:
+                            print(f"      ❌ 严重警告: 数据覆盖率极低，建议检查后重新运行")
+                    else:
+                        print(f"   -> {name} 无有效数据更新")
+
+                    conn.commit()
+
+                except Exception as e:
+                    print(f"   -> {name} 更新异常: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    continue
+
+            print(f"\n✅ 所有指数增量更新完成")
+
+        except Exception as e:
+            print(f"\n❌ 增量更新异常: {e}")
+            import traceback
+            traceback.print_exc()
         finally:
             conn.close()
 
@@ -427,16 +671,15 @@ class DataEngine:
 
     def _fetch_sina_kline(self, symbol):
         try:
-            res = requests.get("https://quotes.sina.cn/cn/api/json_v2.php/CN_MarketData.getKLineData", 
+            res = requests.get("https://quotes.sina.cn/cn/api/json_v2.php/CN_MarketData.getKLineData",
                              params={"symbol":symbol, "scale":"1", "ma":"no", "datalen":"1200"}, timeout=3).json()
             if res:
                 df = pd.DataFrame(res)
                 df['time'] = pd.to_datetime(df['day'])
-                df['vol_hand'] = pd.to_numeric(df['volume'], errors='coerce')
                 df['close'] = pd.to_numeric(df['close'], errors='coerce')
-                # 成交额(亿元) = 手数 * 收盘价 * 100 / 1e8
-                df['amt_100m'] = df['vol_hand'] * df['close'] * 100 / 1e8
-                return df[['time', 'vol_hand', 'amt_100m']]
+                # amount 字段直接是成交额(元)，转换为亿元
+                df['amt_100m'] = pd.to_numeric(df['amount'], errors='coerce') / 1e8
+                return df[['time', 'close', 'amt_100m']]
         except Exception as e:
             print(f"   拉取{symbol}失败: {e}")
         return pd.DataFrame()
@@ -446,33 +689,23 @@ class DataEngine:
         df_sh = self._fetch_sina_kline("sh000001")
         df_sz = self._fetch_sina_kline("sz399001")
         if df_sh.empty or df_sz.empty: return None
-        
+
         df_m = pd.merge(df_sh, df_sz, on='time', how='inner', suffixes=('_sh', '_sz'))
         df_m['amt'] = df_m['amt_100m_sh'] + df_m['amt_100m_sz']
-        
+
         all_dates = sorted(df_m['time'].dt.date.unique())
         if not all_dates: return None
-        
+
         curr, last = datetime.now().date(), all_dates[-1]
         t_d = curr if last < curr else last
-        # 计算上个交易日
-        conn = db.get_conn()
-        try:
-            # 从数据库获取所有交易日，按日期降序排列
-            df_trade_dates = pd.read_sql("SELECT DISTINCT trade_date FROM daily_nodes ORDER BY trade_date DESC", conn)
-            # 转换为日期类型
-            df_trade_dates['trade_date'] = pd.to_datetime(df_trade_dates['trade_date']).dt.date
-            # 获取今天的日期字符串
-            today_str = str(t_d)
-            # 找出所有在今天之前的交易日
-            past_dates = df_trade_dates[df_trade_dates['trade_date'] < t_d]['trade_date'].tolist()
-            # 上个交易日是最近的一个过去交易日
-            y_d = past_dates[0] if past_dates else t_d - timedelta(days=1)
-        except:
-            # 如果数据库查询失败，默认使用昨天
-            y_d = t_d - timedelta(days=1)
-        finally:
-            conn.close()
+
+        # 优先从新浪数据中获取上个交易日（更可靠）
+        # 找到今天之前的最近一个有数据的日期
+        past_dates_in_data = [d for d in all_dates if d < t_d]
+        y_d = past_dates_in_data[-1] if past_dates_in_data else t_d - timedelta(days=1)
+
+        # 数据库缓存仅用于获取昨日节点数据
+        yn_db = self._get_nodes_from_db(str(y_d))
         
         # 使用昨日官方全市场成交额对新浪数据做口径校准
         try:
@@ -503,8 +736,6 @@ class DataEngine:
 
         yn, yc = (None, pd.DataFrame(columns=['hhmm', 'cumsum']))
         # 1. 处理上个交易日数据
-        # 先尝试从数据库获取（用于缓存），但展示逻辑优先使用最新计算结果
-        yn_db = self._get_nodes_from_db(str(y_d))
         if not df_y.empty:
             # 有昨日分钟数据：直接按成交额(亿元)重新计算节点
             yn, yc = calc_nodes(df_y, str(y_d))
@@ -571,6 +802,14 @@ class DataEngine:
                     start_date = dates_sorted[0]
                     end_date = dates_sorted[-1]
                     dates_ui = dates_to_update
+
+                    # 【关键修复】增量更新时，需要额外拉取历史数据来计算MA20
+                    # 从第一个需要更新的日期往前推25个交易日（MA20需要20天，多留几天余量）
+                    buffer_days = 25
+                    if start_date in all_cal:
+                        idx = all_cal.index(start_date)
+                        start_date = all_cal[max(0, idx - buffer_days)]
+                        print(f"   为了计算MA20，实际拉取从 {start_date} 开始的数据")
                 else:
                     # 数据库为空，执行全量初始化
                     print("   数据库为空，执行全量初始化...")
@@ -693,7 +932,7 @@ class DataEngine:
             save(map_l1, 'level1')
             save(map_l2, 'level2')
             conn.commit()
-            print(f"   ✅ {'增量' if incremental else '全量'}更新完成")
+            print(f"   [OK] {'增量' if incremental else '全量'}更新完成")
         finally:
             conn.close()
 
@@ -1170,6 +1409,7 @@ class DataEngine:
             name_map = dict(zip(df_names['ts_code'], df_names['name']))
         except: name_map = {}
         
+        from tasks.strategy_algo import StrategyAlgo
         algo = StrategyAlgo()
         res = []
         pool = STRATEGY_POOL['ALL']
@@ -1541,6 +1781,108 @@ class DataEngine:
             
         except Exception as e:
             print(f"获取个股数据异常 {ts_code}: {e}")
+            return pd.DataFrame()
+
+    def fuzzy_search_stock(self, keyword):
+        """
+        模糊搜索股票：支持代码(自动补后缀)和名称(中文)
+        返回: (ts_code, name) 或 (None, None)
+        """
+        keyword = str(keyword).strip()
+        if not keyword: return None, None
+
+        try:
+            # 1. 如果是纯数字，尝试补全后缀
+            if keyword.isdigit() and len(keyword) == 6:
+                if keyword.startswith('6'): suffix = '.SH'
+                elif keyword.startswith(('0', '3')): suffix = '.SZ'
+                elif keyword.startswith(('4', '8')): suffix = '.BJ'
+                else: suffix = '.SH'
+                
+                ts_code = keyword + suffix
+                # 验证是否存在
+                df = pro.stock_basic(ts_code=ts_code, fields='ts_code,name')
+                if not df.empty:
+                    return df.iloc[0]['ts_code'], df.iloc[0]['name']
+            
+            # 2. 如果不是代码，或者是代码但没搜到，或者是非6位数字，进行全名匹配
+            # 这里的缓存机制很简单：首次加载全量列表（只有几千行，很快）
+            if not hasattr(self, '_stock_basic_cache'):
+                print(">> [Data] 加载全市场股票列表用于搜索...")
+                self._stock_basic_cache = pro.stock_basic(fields='ts_code,symbol,name', list_status='L')
+            
+            df_all = self._stock_basic_cache
+            
+            # 优先精确匹配名称
+            match = df_all[df_all['name'] == keyword]
+            if not match.empty:
+                return match.iloc[0]['ts_code'], match.iloc[0]['name']
+            
+            # 其次包含匹配名称
+            match = df_all[df_all['name'].str.contains(keyword)]
+            if not match.empty:
+                # 返回市值最大的那个？或者第一个。这里简单返回第一个
+                return match.iloc[0]['ts_code'], match.iloc[0]['name']
+                
+            # 再次尝试匹配 symbol (比如输入 600519 但没输后缀)
+            match = df_all[df_all['symbol'] == keyword]
+            if not match.empty:
+                return match.iloc[0]['ts_code'], match.iloc[0]['name']
+
+            return None, None
+            
+        except Exception as e:
+            print(f"搜索股票异常: {e}")
+            return None, None
+
+    def get_stock_data_for_llm(self, ts_code, days=365):
+        """
+        获取投喂给 LLM 的全量数据
+        包含：OHLCV, MA(5,10,20,30,60,120,200,250), VMA20
+        """
+        try:
+            # 多取 300 天用于计算长期均线
+            real_days = days + 300
+            end_date = datetime.now().strftime('%Y%m%d')
+            start_date = (datetime.now() - timedelta(days=real_days)).strftime('%Y%m%d')
+            
+            # 1. 获取日线 (不复权？威科夫通常看复权后的连续K线，这里统一用前复权)
+            df = pro.daily(ts_code=ts_code, start_date=start_date, end_date=end_date)
+            if df.empty: return pd.DataFrame()
+            
+            # 2. 复权因子
+            df_adj = pro.adj_factor(ts_code=ts_code, start_date=start_date, end_date=end_date)
+            if not df_adj.empty:
+                df = df.merge(df_adj, on=['ts_code','trade_date'], how='left')
+                df['adj_factor'] = df['adj_factor'].fillna(method='ffill').fillna(1.0)
+                latest_adj = df['adj_factor'].iloc[0] # tushare返回是倒序的，第一行是最新
+                
+                # 计算前复权
+                for col in ['open','high','low','close']:
+                    df[col] = df[col] * df['adj_factor'] / latest_adj
+            
+            # 3. 排序 (旧 -> 新) 用于计算均线
+            df = df.sort_values('trade_date').reset_index(drop=True)
+            
+            # 4. 计算均线指标
+            ma_list = [5, 10, 20, 30, 50, 60, 120, 200, 250]
+            for ma in ma_list:
+                df[f'MA{ma}'] = df['close'].rolling(ma).mean()
+            
+            df['VMA20'] = df['vol'].rolling(20).mean()
+            
+            # 5. 截取用户请求的最近 N 天
+            df_final = df.iloc[-days:].copy()
+            
+            # 6. 格式化日期
+            df_final['date'] = pd.to_datetime(df_final['trade_date']).dt.strftime('%Y-%m-%d')
+            
+            # 7. 保留给 LLM 的列
+            cols = ['date', 'open', 'high', 'low', 'close', 'vol', 'VMA20'] + [f'MA{ma}' for ma in ma_list]
+            return df_final[cols]
+            
+        except Exception as e:
+            print(f"LLM数据获取异常: {e}")
             return pd.DataFrame()
 
     # ==========================================

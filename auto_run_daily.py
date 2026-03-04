@@ -63,15 +63,15 @@ def main():
     """主函数：设置定时任务"""
     logging.info("🚀 启动每日任务自动运行服务...")
     
-    # 设置运行时间：每天21:00
-    schedule.every().day.at("21:00").do(run_daily_script)
+    # 设置运行时间：每天16:00（收盘后）
+    schedule.every().day.at("16:00").do(run_daily_script)
     
     # 初始运行一次，用于测试
     logging.info("🔧 初始运行一次，用于测试...")
     run_daily_script()
     
     # 持续运行
-    logging.info("⏰ 每日任务自动运行服务已启动，每天21:00执行")
+    logging.info("⏰ 每日任务自动运行服务已启动，每天16:00执行")
     logging.info("按 Ctrl+C 停止服务")
     
     while True:
