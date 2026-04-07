@@ -130,15 +130,12 @@ class XueqiuDataAdapter:
         return [r['strategy_name'] for r in results]
 
     def get_portfolio_nav_curve(self, start_date: str = None, end_date: str = None) -> pd.DataFrame:
-        """获取总仓位加权净值曲线"""
-        # 从 daily_performance 表计算
+        """获取总仓位加权净值曲线（前向填充缺失日期的策略数据，防止非交易日断崖）"""
+        # 获取每个策略在每个日期的 total_asset
         query = """
-            SELECT date,
-                   SUM(total_asset) as total_asset,
-                   SUM(daily_pnl) as total_pnl
+            SELECT date, strategy_name, total_asset
             FROM daily_performance
-            GROUP BY date
-            ORDER BY date
+            ORDER BY strategy_name, date
         """
         results = self._execute_query(query)
         if not results:
@@ -148,12 +145,20 @@ class XueqiuDataAdapter:
         if df.empty:
             return df
 
-        # 计算加权净值（简化版本：使用总资产变化）
-        initial_asset = df['total_asset'].iloc[0] if len(df) > 0 else 100000
-        df['portfolio_nav'] = df['total_asset'] / initial_asset
-        df['date'] = pd.to_datetime(df['date']).dt.strftime('%Y-%m-%d')
+        # 透视：行为日期，列为策略，值为 total_asset
+        pivot = df.pivot(index='date', columns='strategy_name', values='total_asset')
+        # 前向填充：非交易日缺失的策略数据沿用上一个交易日的值
+        pivot = pivot.ffill()
+        # 按日期汇总总资产
+        total_asset = pivot.sum(axis=1).reset_index()
+        total_asset.columns = ['date', 'total_asset']
 
-        return df[['date', 'portfolio_nav', 'total_asset']]
+        # 计算净值
+        initial_asset = total_asset['total_asset'].iloc[0]
+        total_asset['portfolio_nav'] = total_asset['total_asset'] / initial_asset
+        total_asset['date'] = pd.to_datetime(total_asset['date']).dt.strftime('%Y-%m-%d')
+
+        return total_asset[['date', 'portfolio_nav', 'total_asset']]
 
     def get_strategy_nav_curve(self, strategy_name: str, start_date: str = None, end_date: str = None) -> pd.DataFrame:
         """获取单策略净值曲线"""
